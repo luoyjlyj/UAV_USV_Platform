@@ -36,6 +36,7 @@ import {
 } from '@/services/realtimeTrajectoryAdapter'
 import type { RuntimeNode } from '@/types/monitoring'
 import { normalizeOperationalState } from '@/utils/runtimeOperationalState'
+import { resolveActiveRun } from '@/utils/missionRun'
 import type { AlgorithmDefinition, MissionDetail, MissionStatus } from '@/types/mission'
 
 type UnityMessage = {
@@ -697,10 +698,10 @@ function applyOverviewMissionDetail(detail: MissionDetail) {
   overviewMissionStatus.value = detail.mission.status
   realMissionRuntimeStore.syncContext({
     missionId: detail.mission.id,
-    runId: detail.currentRun?.id ?? null,
+    runId: activeRun?.id ?? null,
     backendMissionStatus: detail.mission.status,
   })
-  const currentRunId = detail.currentRun?.id
+  const currentRunId = activeRun?.id
   const latestControlEvent = detail.events.find((event) =>
     event.runId === currentRunId && /^(MISSION_CONTROL|SYSTEM_OVERVIEW):/.test(event.source ?? ''),
   )
@@ -1102,8 +1103,16 @@ function sendRealOverviewScenario(detail?: MissionDetail | null) {
   const missionId = detail?.mission.id ?? overviewMissionId.value
   if (!missionId) return
   const activeRun = resolveActiveRun(detail)
-  if (detail) overviewActiveMissionRunId.value = activeRun?.id ?? null
-  const runId = activeRun?.id ?? currentOverviewUnityRuntimeId()
+
+  if (detail) {
+    overviewActiveMissionRunId.value = activeRun?.id ?? null
+  }
+
+  const runId =
+    activeRun?.id ??
+    realMissionRuntimeStore.currentRunId ??
+    currentOverviewUnityRuntimeId() ??
+    null
   const algorithmCode = detail?.mission.algorithmCode ?? selectedOverviewAlgorithm.value
   if (!runId) return
   const scenarioKey = `${missionId}:${runId}:${algorithmCode}`
@@ -1132,7 +1141,7 @@ function syncRealOverviewUnityScene() {
 }
 
 async function triggerRealOverviewMissionStart(detail: MissionDetail) {
-  const run = detail.currentRun
+  const run = resolveActiveRun(detail)
   if (!run) throw new Error('当前真实任务没有可启动的运行批次')
   const result = await issueRuntimeCommand({
     commandType: 'START_MISSION',
