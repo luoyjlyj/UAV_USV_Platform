@@ -1,22 +1,30 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, watch } from 'vue'
 import { RouterView } from 'vue-router'
 import { useRoute } from 'vue-router'
 import UnityRuntimeHost from '@/components/unity/UnityRuntimeHost.vue'
 import SimulationRuntimeHost from '@/components/unity/SimulationRuntimeHost.vue'
 import { simulationRuntime } from '@/composables/simulationRuntime'
+import { useAuthStore } from '@/stores/auth'
+import { useRealtimeStore } from '@/stores/realtime'
+import { useUnityBridgeStore } from '@/stores/unityBridge'
 import { useUnityViewportStore } from '@/stores/unityViewport'
 
 const route = useRoute()
+const authStore = useAuthStore()
+const realtimeStore = useRealtimeStore()
+const unityBridgeStore = useUnityBridgeStore()
 const unityViewportStore = useUnityViewportStore()
 
-const showSystemOverviewUnity = computed(
-  () => Boolean(route.meta.requiresAuth)
-    && (route.name === 'dashboard' || route.name === 'optical-vision'),
+const mountSystemOverviewUnity = computed(() => Boolean(route.meta.requiresAuth))
+const systemOverviewUnityActive = computed(() =>
+  (route.name === 'dashboard' && route.query.workspace !== 'simulation')
+  || route.name === 'optical-vision',
 )
-const systemOverviewUnityActive = computed(
-  () => route.name === 'optical-vision'
-    || (route.name === 'dashboard' && route.query.workspace !== 'simulation'),
+const systemOverviewUnityViewport = computed(() =>
+  route.name === 'optical-vision'
+    ? 'visual-sensors-live'
+    : 'dashboard',
 )
 const showMissionCenterUnity = computed(
   () =>
@@ -24,6 +32,29 @@ const showMissionCenterUnity = computed(
     && route.name === 'situation'
     && unityViewportStore.target === 'mission-execution',
 )
+
+watch(
+  () => authStore.isAuthenticated,
+  (authenticated) => {
+    if (authenticated) realtimeStore.connect()
+    else realtimeStore.disconnect()
+  },
+  { immediate: true },
+)
+
+const visualSubscriptionActive = computed(() =>
+  systemOverviewUnityActive.value && route.name === 'optical-vision',
+)
+
+watch(visualSubscriptionActive, (active, wasActive) => {
+  if (active || !wasActive) return
+  unityBridgeStore.sendFor('SYSTEM_OVERVIEW', 'visualSensorSubscribe', {
+    enabled: false,
+    displayMode: 'off',
+    gpuDirect: false,
+    jpegFallback: false,
+  })
+})
 </script>
 
 <template>
@@ -32,8 +63,8 @@ const showMissionCenterUnity = computed(
     :active="route.name === 'dashboard' && route.query.workspace === 'simulation'"
   />
   <UnityRuntimeHost
-    v-if="showSystemOverviewUnity"
-    :viewport="route.name === 'optical-vision' ? 'visual-sensors-live' : 'dashboard'"
+    v-if="mountSystemOverviewUnity"
+    :viewport="systemOverviewUnityViewport"
     runtime-scope="SYSTEM_OVERVIEW"
     runtime-instance-id="overview-unity-01"
     :active="systemOverviewUnityActive"

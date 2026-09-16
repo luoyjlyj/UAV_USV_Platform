@@ -1,26 +1,35 @@
 <script setup lang="ts">
 import { computed, reactive, watch } from 'vue'
-import type { AlgorithmRuntimeFrame } from '@/types/mission'
+import type { AuthoritativeFrame } from '@/types/authoritativeFrame'
+import {
+  appendVehicleHistoryPoint,
+  resetVehicleHistoriesForScope,
+  type VehicleHistory,
+} from '@/services/realtimeTrajectoryAdapter'
 
-const props=defineProps<{frame:AlgorithmRuntimeFrame|null;selectedDeviceCode?:string}>()
+const props=defineProps<{frame:AuthoritativeFrame|null;selectedDeviceCode?:string;algorithmStatusText?:string}>()
 const emit=defineEmits<{select:[code:string];placeThreat:[x:number,y:number]}>()
 const width=1200,height=620,plot={x:22,y:22,w:1156,h:576}
-const histories=reactive<Record<string,Array<{x:number;y:number}>>>({})
+const vehicleHistories=reactive<Record<string,VehicleHistory>>({})
+const targetHistories=reactive<Record<string,Array<{x:number;y:number}>>>({})
 const telemetry=reactive({distance:[] as number[],minimumSpacing:[] as number[],stability:[] as number[]})
-let runId:number|null=null
+let frameScope=''
+const observationOnly=computed(()=>props.frame?.mode==='OBSERVATION_ONLY')
 
-const visibleTargets=computed(()=>props.frame?.targets.filter(item=>props.frame?.algorithmCode==='ESCORT_GUARD'
-  ? item.type!=='CAPTURE_TARGET'
-  : item.type!=='ESCORT_TARGET'&&item.type!=='THREAT_TARGET')||[])
+const visibleTargets=computed(()=>props.frame?.targets.filter(item=>item.visible!==false&&item.type!=='ESCORT_TARGET')||[])
 const objects=computed(()=>props.frame?[...props.frame.agents,...visibleTargets.value]:[])
 const uavs=computed(()=>props.frame?.agents.filter(item=>item.type==='UAV')||[])
 const usvs=computed(()=>props.frame?.agents.filter(item=>item.type==='USV')||[])
 const captureTarget=computed(()=>props.frame?.targets.find(item=>item.type==='CAPTURE_TARGET'))
-const activeTarget=computed(()=>props.frame?.targets.find(item=>item.type===(props.frame?.algorithmCode==='ESCORT_GUARD'?'ESCORT_TARGET':'CAPTURE_TARGET')))
+const activeTarget=computed(()=>observationOnly.value
+  ? visibleTargets.value[0]
+  : visibleTargets.value.find(item=>item.type===(props.frame?.algorithmCode==='ESCORT_GUARD'?'THREAT_TARGET':'CAPTURE_TARGET')))
 const bounds=computed(()=>{
   const points=objects.value.flatMap(item=>[
     {x:item.x,y:item.y},
-    ...(histories[item.code]||[]).slice(-160),
+    ...(item.type==='UAV'||item.type==='USV'
+      ? (vehicleHistories[item.code]||[]).flat().slice(-160)
+      : (targetHistories[item.code]||[]).slice(-160)),
   ])
   if(!points.length)return{minX:-80,maxX:80,minY:-48,maxY:48}
   let minX=Math.min(...points.map(p=>p.x)),maxX=Math.max(...points.map(p=>p.x))
@@ -34,11 +43,20 @@ const bounds=computed(()=>{
 })
 const sx=(x:number)=>plot.x+(x-bounds.value.minX)/(bounds.value.maxX-bounds.value.minX)*plot.w
 const sy=(y:number)=>plot.y+plot.h-(y-bounds.value.minY)/(bounds.value.maxY-bounds.value.minY)*plot.h
-const color=(type:string)=>type==='UAV'?'#ffc83d':type==='USV'?'#ff646d':type==='ESCORT_TARGET'?'#54e6aa':'#3fc9f2'
-const label=(item:{code:string;type:string})=>item.type==='CAPTURE_TARGET'?'围捕目标':item.type==='ESCORT_TARGET'?'护航目标':item.type==='THREAT_TARGET'?'威胁目标':item.code.toUpperCase().replace('_','-')
-const path=(code:string,recent=false)=>{
-  const points=histories[code]||[],source=recent?points.slice(-80):points
+const color=(type:string)=>type==='UAV'?'#ffc83d':type==='USV'?'#ff646d':'#3fc9f2'
+const label=(item:{code:string;type:string})=>item.type==='CAPTURE_TARGET'?'围捕目标':item.type==='THREAT_TARGET'?'威胁目标':item.type.includes('TARGET')?'任务目标':item.code.toUpperCase().replace('_','-')
+const targetPath=(code:string,recent=false)=>{
+  const points=targetHistories[code]||[],source=recent?points.slice(-80):points
   return source.map((point,index)=>`${index?'L':'M'} ${sx(point.x)} ${sy(point.y)}`).join(' ')
+}
+const vehiclePaths=(code:string,recent=false)=>{
+  const segments=vehicleHistories[code]||[]
+  if(!recent)return segments.map(segment=>segment.map((point,index)=>`${index?'L':'M'} ${sx(point.x)} ${sy(point.y)}`).join(' '))
+  let remaining=80
+  return segments.slice().reverse().map(segment=>{
+    const source=segment.slice(-remaining);remaining=Math.max(0,remaining-source.length)
+    return source.map((point,index)=>`${index?'L':'M'} ${sx(point.x)} ${sy(point.y)}`).join(' ')
+  }).reverse().filter(Boolean)
 }
 const routePath=computed(()=>props.frame?.route.map((point,index)=>`${index?'L':'M'} ${sx(point[0]||0)} ${sy(point[1]||0)}`).join(' ')||'')
 const polygon=(items:Array<{x:number;y:number}>)=>items.map(item=>`${sx(item.x)},${sy(item.y)}`).join(' ')
@@ -62,26 +80,33 @@ function quality(items:Array<{x:number;y:number}>,target?:{x:number;y:number}){
 }
 const uavQuality=computed(()=>quality(uavs.value))
 const usvQuality=computed(()=>quality(usvs.value,activeTarget.value))
-const usvQualityLabel=computed(()=>props.frame?.algorithmCode==='ESCORT_GUARD'?'USV 护卫环质量':'USV 环形围捕质量')
+const usvQualityLabel=computed(()=>observationOnly.value?'USV 编队质量':props.frame?.algorithmCode==='ESCORT_GUARD'?'USV 护卫环质量':'USV 环形围捕质量')
 const latest=(values:number[])=>values.length?values[values.length-1]:undefined
+const metric=(value:number|undefined,suffix:string,d=1)=>Number.isFinite(value)?`${format(value,d)}${suffix}`:'--'
 const selectedObject=computed(()=>objects.value.find(item=>item.code.toLowerCase()===props.selectedDeviceCode?.toLowerCase())??null)
 const situationJudgement=computed(()=>{
   if(!props.frame)return'等待实时数据'
+  if(observationOnly.value)return props.algorithmStatusText||'等待算法首帧'
   if(props.frame.algorithmCode==='ESCORT_GUARD')return ['THREAT_RESPONSE','COMPLETED'].includes(props.frame.phase)?'护航响应已建立':'护航编队运行中'
   return enclosure.value?'包围态势已形成':'包围态势建立中'
 })
 const metricCards=computed(()=>[
-  {key:'uav',title:'UAV 编队质量',value:uavQuality.value===null?'--':`${format(uavQuality.value,0)}%`,tone:'uav'},
-  {key:'usv',title:usvQualityLabel.value,value:usvQuality.value===null?'--':`${format(usvQuality.value,0)}%`,tone:'usv'},
-  {key:'distance',title:'目标平均距离',value:`${format(latest(telemetry.distance),1)} m`,tone:'neutral'},
-  {key:'minimumSpacing',title:'最小水平间距',value:`${format(latest(telemetry.minimumSpacing),1)} m`,tone:'safe'},
-  {key:'stability',title:'编队稳定度',value:`${format(latest(telemetry.stability),0)}%`,tone:'neutral'},
+  {key:'uav',title:'UAV 编队质量',value:uavs.value.length>=3?metric(uavQuality.value??undefined,'%',0):'--',tone:'uav'},
+  {key:'usv',title:usvQualityLabel.value,value:usvs.value.length>=3&&activeTarget.value?metric(usvQuality.value??undefined,'%',0):'--',tone:'usv'},
+  {key:'distance',title:'目标平均距离',value:metric(latest(telemetry.distance),' m'),tone:'neutral'},
+  {key:'minimumSpacing',title:'最小水平间距',value:metric(latest(telemetry.minimumSpacing),' m'),tone:'safe'},
+  {key:'stability',title:'编队稳定度',value:metric(latest(telemetry.stability),'%',0),tone:'neutral'},
 ])
-watch(()=>props.frame?.sequence,()=>{
+watch(()=>props.frame,()=>{
   if(!props.frame)return
-  if(runId!==props.frame.runId){runId=props.frame.runId;Object.keys(histories).forEach(k=>delete histories[k]);telemetry.distance=[];telemetry.minimumSpacing=[];telemetry.stability=[]}
-  for(const item of [...props.frame.agents,...visibleTargets.value]){
-    const list=histories[item.code]||(histories[item.code]=[]),last=list[list.length-1]
+  const nextScope=`${props.frame.missionId??'workspace'}:${props.frame.runId??'no-run'}`
+  if(frameScope!==nextScope){frameScope=resetVehicleHistoriesForScope(frameScope,nextScope,vehicleHistories);Object.keys(targetHistories).forEach(k=>delete targetHistories[k]);telemetry.distance=[];telemetry.minimumSpacing=[];telemetry.stability=[]}
+  for(const item of props.frame.agents){
+    const history=vehicleHistories[item.code]||(vehicleHistories[item.code]=[])
+    appendVehicleHistoryPoint(history,{x:item.x,y:item.y,positionAuthority:item.positionAuthority,coordinateFrame:props.frame.coordinateFrame??null,runId:props.frame.runId})
+  }
+  for(const item of visibleTargets.value){
+    const list=targetHistories[item.code]||(targetHistories[item.code]=[]),last=list[list.length-1]
     if(!last||Math.hypot(last.x-item.x,last.y-item.y)>.06)list.push({x:item.x,y:item.y})
     if(list.length>520)list.splice(0,list.length-520)
   }
@@ -142,7 +167,11 @@ function placeThreat(event:MouseEvent){
         <polygon v-if="frame?.algorithmCode==='GB_SFLA_CS'&&uavs.length===3&&enclosure" :points="polygon(uavs)" class="uav-form"/>
         <circle v-if="frame?.algorithmCode==='GB_SFLA_CS'&&usvs.length===3&&captureTarget&&enclosure" :cx="sx(captureTarget.x)" :cy="sy(captureTarget.y)" :r="ringRadius" class="usv-form"/>
         <g v-for="item in objects" :key="item.code">
-          <path :d="path(item.code)" :stroke="color(item.type)" class="trail old"/><path :d="path(item.code,true)" :stroke="color(item.type)" class="trail recent"/>
+          <template v-if="item.type==='UAV'||item.type==='USV'">
+            <path v-for="(segment,index) in vehiclePaths(item.code)" :key="`old-${index}`" :d="segment" :stroke="color(item.type)" class="trail old"/>
+            <path v-for="(segment,index) in vehiclePaths(item.code,true)" :key="`recent-${index}`" :d="segment" :stroke="color(item.type)" class="trail recent"/>
+          </template>
+          <template v-else><path :d="targetPath(item.code)" :stroke="color(item.type)" class="trail old"/><path :d="targetPath(item.code,true)" :stroke="color(item.type)" class="trail recent"/></template>
           <g class="marker" :class="{selected:item.code.toLowerCase()===selectedDeviceCode?.toLowerCase()}" @click.stop="emit('select',item.code.toLowerCase())">
             <circle :cx="sx(item.x)" :cy="sy(item.y)" :r="item.type.includes('TARGET')?7:5" :fill="color(item.type)"/>
             <line :x1="sx(item.x)" :y1="sy(item.y)" :x2="sx(item.x)+Math.cos(item.heading*Math.PI/180)*14" :y2="sy(item.y)-Math.sin(item.heading*Math.PI/180)*14" :stroke="color(item.type)"/>
@@ -161,15 +190,16 @@ function placeThreat(event:MouseEvent){
           <div><dt>目标北向</dt><dd>{{ format(activeTarget?.y,1) }} m</dd></div>
         </dl>
         <div class="legend">
-          <span><i class="uav"/>UAV</span><span><i class="usv"/>USV</span><span><i class="target"/>任务目标</span>
+          <span><i class="uav"/>UAV</span><span><i class="usv"/>USV</span><span><i class="target"/>任务目标 / 敌船</span>
         </div>
       </aside>
     </div>
-    <footer class="phase">
+    <footer v-if="!observationOnly" class="phase">
       <div class="phase-title"><span>任务阶段</span><b>{{ phaseLabel }}</b></div>
       <div class="arc"><i :style="{width:`${phaseIndex/(steps.length-1)*100}%`}"/></div>
       <ol><li v-for="(step,index) in steps" :key="step" :class="{active:index<=phaseIndex,current:index===phaseIndex}"><i/>{{ step }}</li></ol>
     </footer>
+    <footer v-else class="phase"><div class="phase-title"><span>任务阶段</span><b>{{ algorithmStatusText || '等待算法首帧' }}</b></div></footer>
   </section>
 </template>
 

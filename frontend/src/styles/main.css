@@ -5246,6 +5246,7 @@ h2 {
   border-radius: 8px;
   box-shadow: 0 8px 28px rgba(0, 8, 14, 0.5), inset 0 1px rgba(139, 228, 238, 0.05);
   backdrop-filter: blur(12px);
+  pointer-events: auto;
 }
 
 .overview-selected-control.usv {

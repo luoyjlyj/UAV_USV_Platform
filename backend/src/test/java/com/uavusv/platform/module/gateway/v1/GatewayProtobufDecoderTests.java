@@ -104,6 +104,62 @@ class GatewayProtobufDecoderTests {
     }
 
     @Test
+    void shouldDecodeTargetBatchEnvelopeWithSourceAndEnvelopeTimestampsSeparated() {
+        Instant sentAt = Instant.parse("2026-09-08T08:00:01Z");
+        Instant sourceAt = Instant.parse("2026-09-08T08:00:00.500Z");
+        UavUsvGatewayV1.TargetState target = UavUsvGatewayV1.TargetState.newBuilder()
+                .setId("enemy_ship")
+                .setFrameId("map")
+                .setCoordinateValid(true)
+                .setPosition(UavUsvGatewayV1.Vector3.newBuilder().setX(-133.8).setY(-330.4).setZ(0.64))
+                .setPose(UavUsvGatewayV1.TargetPose.newBuilder()
+                        .setPosition(UavUsvGatewayV1.Vector3.newBuilder().setX(-133.8).setY(-330.4).setZ(0.64))
+                        .setOrientation(UavUsvGatewayV1.Quaternion.newBuilder().setW(1)))
+                .setVelocity(UavUsvGatewayV1.TargetVelocity.newBuilder()
+                        .setLinear(UavUsvGatewayV1.Vector3.newBuilder().setX(1.2))
+                        .setAngular(UavUsvGatewayV1.Vector3.newBuilder().setZ(0.1)))
+                .setSourceStream("ground_truth")
+                .setTimestamp(Timestamp.newBuilder().setSeconds(sourceAt.getEpochSecond()).setNanos(sourceAt.getNano()))
+                .setClassification("VESSEL")
+                .setAffiliation("UNKNOWN")
+                .setConfidence(1.0)
+                .build();
+        UavUsvGatewayV1.GatewayEnvelope protobufEnvelope = UavUsvGatewayV1.GatewayEnvelope.newBuilder()
+                .setSpecVersion("1.0")
+                .setMessageType("telemetry.target_batch")
+                .setSource("uav_usv_fleet_gateway")
+                .setMissionId("mission-1")
+                .setRunId("run-1")
+                .setStreamId("fleet.targets.epoch-a")
+                .setSequence(9)
+                .setTimestamp(Timestamp.newBuilder().setSeconds(sentAt.getEpochSecond()))
+                .setTargetBatch(UavUsvGatewayV1.TargetBatch.newBuilder()
+                        .setSnapshotTime(Timestamp.newBuilder().setSeconds(sourceAt.getEpochSecond()).setNanos(sourceAt.getNano()))
+                        .setFrameId("map")
+                        .addTargets(target))
+                .build();
+
+        GatewayEnvelope envelope = decoder.decode(protobufEnvelope.toByteArray());
+
+        assertEquals(GatewayMessageType.TELEMETRY_TARGET_BATCH, envelope.type());
+        assertEquals(UavUsvGatewayV1.GatewayEnvelope.BodyCase.TARGET_BATCH, protobufEnvelope.getBodyCase());
+        assertNotNull(protobufEnvelope.getTargetBatch());
+        assertEquals("mission-1", envelope.missionId());
+        assertEquals(sentAt, envelope.timestamp());
+        assertEquals("fleet.targets.epoch-a", envelope.streamId());
+        var decoded = envelope.payload().path("targets").path(0);
+        assertEquals("enemy_ship", decoded.path("id").asText());
+        assertEquals("map", decoded.path("frameId").asText());
+        assertEquals(true, decoded.path("coordinateValid").asBoolean());
+        assertEquals(-133.8, decoded.path("position").path("x").asDouble(), 0.0001);
+        assertEquals("2026-09-08T08:00:00.500Z", decoded.path("timestamp").asText());
+        assertEquals("ground_truth", decoded.path("sourceStream").asText());
+        assertEquals("VESSEL", decoded.path("classification").asText());
+        assertEquals("UNKNOWN", decoded.path("affiliation").asText());
+        assertEquals(1.0, decoded.path("confidence").asDouble(), 0.0001);
+    }
+
+    @Test
     void shouldDecodeControlAckEnvelope() {
         UavUsvGatewayV1.ControlAck ack = UavUsvGatewayV1.ControlAck.newBuilder()
                 .setCommandId("command-1")

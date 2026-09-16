@@ -19,11 +19,10 @@ import { useTrajectoryStore } from '@/stores/trajectory'
 import { useUnityBridgeStore } from '@/stores/unityBridge'
 import { useUnityViewportStore } from '@/stores/unityViewport'
 import { useVisualSensorStore } from '@/stores/visualSensor'
-import type { UnityTrajectoryFrame } from '@/stores/trajectory'
 import {
+  algorithmFrameToTrajectoryFrame,
   isRealtimeEnvelopeApplicable,
-  poseBatchToTrajectoryFrame,
-  trajectoryFrameToMissionCenterPoseFrame,
+  mergeAuthoritativeFrame,
 } from '@/services/realtimeTrajectoryAdapter'
 import type { AlgorithmRuntimeFrame, MissionDetail } from '@/types/mission'
 import type { RuntimeNode } from '@/types/monitoring'
@@ -61,14 +60,18 @@ const missionVisualConnected = computed(() =>
 )
 const unityRunSynchronized = computed(() =>
   unityChannel.value.appliedRunId === runId.value
-  && !!algorithmFrame.value
-  && unityChannel.value.appliedSequence >= algorithmFrame.value.sequence,
+  && unityChannel.value.sentSequence > 0
+  && unityChannel.value.appliedSequence === unityChannel.value.sentSequence,
 )
 const externalAlgorithm = computed(() => !!detail.value && ['GB_SFLA_CS', 'ESCORT_GUARD'].includes(detail.value.mission.algorithmCode))
 let algorithmPollTimer: number | null = null
 let algorithmAbortController: AbortController | null = null
 let loadedScenarioKey = ''
-let lastRealtimePoseFrameKey = ''
+let poseFreshnessTimer: number | null = null
+let unityPoseSequence = 0
+let unitySenderRunId: number | null = null
+let lastMergedPoseFingerprint = ''
+const poseFreshnessNow = ref(Date.now())
 let algorithmRecoveryPromise: Promise<void> | null = null
 
 function missionVisualContext(): VisualSensorRuntimeContext {
@@ -167,31 +170,33 @@ function ensureMissionScenarioLoaded() {
     missionId: mission.id,
     runId: currentRun.id,
   })
-  if (algorithmFrame.value?.runId === currentRun.id) {
-    sendAlgorithmPoseFrame(algorithmFrame.value)
-  }
   loadedScenarioKey = key
+  sendMergedPoseFrameToUnity(true)
 }
 
-const realtimeTrajectoryFrame = computed<UnityTrajectoryFrame | null>(() => {
+const applicablePoseBatch = computed(() => {
   const envelope = realtimeStore.poseBatch
-  if (!isRealtimeEnvelopeApplicable(envelope, { runId: runId.value }, 'STRICT')) return null
-  const missionStatus = isRealtimeEnvelopeApplicable(
-    realtimeStore.missionStatus,
-    { runId: runId.value },
-    'STRICT',
-  )
-    ? realtimeStore.missionStatus?.payload
-    : null
-  return poseBatchToTrajectoryFrame(envelope, {
-    missionId: missionId.value,
-    runId: runId.value,
-    phase: missionStatus?.phase ?? missionStatus?.state ?? 'ROS_GATEWAY_V1',
-  })
+  if (!isRealtimeEnvelopeApplicable(envelope, { missionId: detail.value?.mission.id ?? missionId.value, runId: detail.value?.currentRun?.id ?? runId.value }, 'OBSERVATION')) return null
+  return envelope
 })
 
-const trajectoryFrame = computed<UnityTrajectoryFrame | null>(() =>
-  realtimeTrajectoryFrame.value ?? trajectoryStore.channels.MISSION_CENTER.frame,
+const applicableTargetBatch = computed(() => {
+  const envelope = realtimeStore.targetBatch
+  if (!isRealtimeEnvelopeApplicable(envelope, { missionId: detail.value?.mission.id ?? missionId.value, runId: detail.value?.currentRun?.id ?? runId.value }, 'OBSERVATION')) return null
+  return envelope
+})
+
+const mergedAuthoritativeFrame = computed(() => mergeAuthoritativeFrame(
+  algorithmFrame.value,
+  applicablePoseBatch.value,
+  applicableTargetBatch.value,
+  poseFreshnessNow.value,
+  3000,
+  { missionId: detail.value?.mission.id ?? missionId.value, runId: detail.value?.currentRun?.id ?? runId.value },
+))
+
+const trajectoryFrame = computed(() =>
+  algorithmFrameToTrajectoryFrame(mergedAuthoritativeFrame.value),
 )
 
 const runtimeNodes = computed<RuntimeNode[]>(() => {
@@ -257,9 +262,13 @@ async function loadDetail() {
   const requestedRun = loaded.runs.find(run => run.id === runId.value) ?? (loaded.currentRun?.id === runId.value ? loaded.currentRun : null)
   if (!requestedRun) throw new Error('未找到该任务运行批次')
   loaded.currentRun = requestedRun
+  const runChanged = realMissionRuntimeStore.currentRunId !== requestedRun.id
   if (algorithmFrame.value?.runId !== requestedRun.id) {
     algorithmFrame.value = null
     loadedScenarioKey = ''
+    unityPoseSequence = 0
+    unitySenderRunId = null
+    lastMergedPoseFingerprint = ''
     trajectoryStore.clearFor('MISSION_CENTER')
     unityBridgeStore.clearPoseFramesFor('MISSION_CENTER')
   }
@@ -270,6 +279,7 @@ async function loadDetail() {
     backendMissionStatus: loaded.mission.status,
     runScopePolicy: 'STRICT',
   })
+  if (runChanged) await realtimeStore.refreshSnapshot()
   sessionStore.bind(loaded.mission.id, requestedRun.id)
   unityViewportStore.prepareMission(loaded.mission.id, requestedRun.id, requestedRun.runtimeInstanceId)
   visualSensorStore.bindRuntime(missionVisualContext())
@@ -283,68 +293,41 @@ async function refreshUntilStatus(expected: string) {
   }
 }
 
-function sendAlgorithmPoseFrame(frame: AlgorithmRuntimeFrame) {
-  unityBridgeStore.sendFor('MISSION_CENTER', 'poseFrame', {
-    algorithmCode: frame.algorithmCode,
-    runId: frame.runId,
-    sequence: frame.sequence,
+function sendMergedPoseFrameToUnity(force = false) {
+  const frame = mergedAuthoritativeFrame.value
+  const run = detail.value?.currentRun
+  if (!frame || !run || !externalAlgorithm.value || !unityChannel.value.controlsReady) return
+  const algorithmCode = frame.mode === 'ALGORITHM_MERGED' ? frame.algorithmCode : detail.value?.mission.algorithmCode
+  if (!algorithmCode) return
+  if (unitySenderRunId !== run.id) {
+    unitySenderRunId = run.id
+    unityPoseSequence = 0
+    lastMergedPoseFingerprint = ''
+  }
+  const sourcePayload = {
+    algorithmCode,
+    runId: run.id,
     timestamp: frame.timestamp,
-    phase: frame.phase,
+    phase: frame.phase ?? 'WAITING_FOR_ALGORITHM',
     agents: frame.agents,
     targets: frame.targets,
     route: frame.route.map(point => ({ x: point[0], y: point[1] })),
     obstacles: frame.obstacles,
+  }
+  const fingerprint = JSON.stringify(sourcePayload)
+  if (!force && fingerprint === lastMergedPoseFingerprint) return
+  lastMergedPoseFingerprint = fingerprint
+  unityPoseSequence += 1
+  unityBridgeStore.sendFor('MISSION_CENTER', 'poseFrame', {
+    ...sourcePayload,
+    sequence: unityPoseSequence,
   })
-}
-
-function sendRealtimePoseFrameToUnity(frame: UnityTrajectoryFrame | null) {
-  const run = detail.value?.currentRun
-  if (!frame || frame.coordinateSystem !== 'ROS_ENU' || !run || !externalAlgorithm.value) return
-  if (!unityChannel.value.controlsReady) return
-  const frameKey = `${run.id}:${frame.source}:${frame.sequence}`
-  if (frameKey === lastRealtimePoseFrameKey) return
-  lastRealtimePoseFrameKey = frameKey
-  const payload = trajectoryFrameToMissionCenterPoseFrame(frame, {
-    algorithmCode: detail.value?.mission.algorithmCode ?? 'GB_SFLA_CS',
-    runId: run.id,
-    route: [],
-  })
-  if (payload) unityBridgeStore.sendFor('MISSION_CENTER', 'poseFrame', payload)
 }
 
 function ingestAlgorithmFrame(frame: AlgorithmRuntimeFrame) {
   if (frame.runId !== runId.value || frame.runId !== detail.value?.currentRun?.id) return
   if (algorithmFrame.value && frame.sequence <= algorithmFrame.value.sequence) return
   algorithmFrame.value = frame
-  const agents = [
-    ...frame.agents.map(item => ({ code: item.code, type: item.type, x: item.x, y: item.y, z: item.z, yaw: item.heading, state: item.role })),
-    ...frame.targets.filter(item => item.visible !== false).map(item => ({ code: item.code, type: 'TARGET', x: item.x, y: item.y, z: item.z, yaw: item.heading, state: item.type })),
-  ]
-  const payload = {
-    sequence: frame.sequence,
-    timestamp: frame.timestamp,
-    source: `algorithm:${frame.algorithmCode}`,
-    coordinateSystem: 'MISSION_SCENE_XZ',
-    mission: {
-      phase: frame.phase,
-      elapsed: Math.round(frame.sequence / 10),
-      captureRadius: Number(
-        frame.metrics.usvFormationRadius
-        ?? frame.metrics.captureRadius
-        ?? 16,
-      ),
-      defenseRadius: Number(
-        frame.metrics.escortFormationRadius
-        ?? frame.metrics.uavFormationRadius
-        ?? 18,
-      ),
-      captureReady: frame.metrics.captured === true,
-      formationHolding: frame.phase === 'CAPTURED' || frame.phase === 'THREAT_RESPONSE',
-    },
-    agents,
-  }
-  trajectoryStore.ingestFor('MISSION_CENTER', payload)
-  sendAlgorithmPoseFrame(frame)
 }
 
 watch([
@@ -355,10 +338,17 @@ watch([
 ], ensureMissionScenarioLoaded, { immediate: true })
 
 watch([
-  realtimeTrajectoryFrame,
+  mergedAuthoritativeFrame,
   () => unityChannel.value.controlsReady,
   () => detail.value?.currentRun?.id,
-], ([frame]) => sendRealtimePoseFrameToUnity(frame), { immediate: true })
+], () => sendMergedPoseFrameToUnity(), { immediate: true })
+
+watch(
+  () => unityChannel.value.scenarioReadyRunId,
+  readyRunId => {
+    if (readyRunId === detail.value?.currentRun?.id) sendMergedPoseFrameToUnity(true)
+  },
+)
 
 async function pollAlgorithmFrames() {
   if (!externalAlgorithm.value || !detail.value?.currentRun || algorithmPolling.value) return
@@ -531,6 +521,9 @@ async function closeExecution() {
 }
 
 onMounted(async () => {
+  poseFreshnessTimer = window.setInterval(() => {
+    poseFreshnessNow.value = Date.now()
+  }, 500)
   unityViewportStore.park()
   realtimeStore.connect()
   monitoringStore.connectEvents()
@@ -549,6 +542,8 @@ onMounted(async () => {
 })
 onBeforeUnmount(() => {
   stopAlgorithmPolling()
+  if (poseFreshnessTimer !== null) window.clearInterval(poseFreshnessTimer)
+  poseFreshnessTimer = null
   if (mode.value === 'vision') sendMissionVisualSubscription(false, 'off')
   visualSensorStore.disposeFrames('MISSION_CENTER')
   unityViewportStore.park()
@@ -561,7 +556,7 @@ onBeforeUnmount(() => {
     :detail="detail"
     :nodes="runtimeNodes"
     :trajectory-frame="trajectoryFrame"
-    :algorithm-frame="algorithmFrame"
+    :algorithm-frame="mergedAuthoritativeFrame"
     :session-state="sessionStore.state"
     :session-revision="sessionStore.revision"
     :selected-device-code="selectedDeviceCode"

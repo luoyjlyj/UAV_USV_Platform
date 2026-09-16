@@ -276,7 +276,7 @@ export const useUnityBridgeStore = defineStore('unityBridge', {
         || sequence <= 0
         || appliedCount <= 0
         || channel.sentRunId !== runId
-        || channel.sentSequence !== sequence
+        || sequence > channel.sentSequence
       ) {
         channel.rejectReason = `poseFrameApplied invalid receipt: runId=${String(payload.runId ?? '')}, sequence=${String(payload.sequence ?? '')}`
         console.warn('[unityBridge] poseFrameApplied rejected', { scope, rejectReason: channel.rejectReason })

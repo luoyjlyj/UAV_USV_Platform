@@ -2,6 +2,7 @@ export type GatewayMessageType =
   | 'gateway.hello'
   | 'gateway.heartbeat'
   | 'telemetry.pose_batch'
+  | 'telemetry.target_batch'
   | 'mission.status'
   | 'control.command'
   | 'control.ack'
@@ -13,6 +14,7 @@ export interface GatewayEnvelope<TPayload = unknown> {
   type: GatewayMessageType | string
   source: string
   timestamp: string
+  missionId?: string | null
   runId?: string | null
   streamId: string
   frameId?: string | null
@@ -62,6 +64,36 @@ export interface PoseBatchPayload {
   staleDeviceCodes?: string[]
   vehicles: VehiclePoseSample[]
   freshnessThresholdMs?: number
+}
+
+export interface TargetPose {
+  position?: RealtimeVector3
+  orientation?: RealtimeQuaternion
+}
+
+export interface TargetVelocity {
+  linear?: RealtimeVector3
+  angular?: RealtimeVector3
+}
+
+export interface TargetState {
+  id: string
+  frameId?: string
+  coordinateValid: boolean
+  position?: RealtimeVector3
+  pose?: TargetPose
+  velocity?: TargetVelocity
+  sourceStream?: string
+  timestamp?: string
+  classification?: string
+  affiliation?: string
+  confidence?: number
+}
+
+export interface TargetBatchPayload {
+  snapshotTime?: string
+  frameId?: string
+  targets: TargetState[]
 }
 
 export interface MissionStatusPayload {

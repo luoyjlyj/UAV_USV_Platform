@@ -29,4 +29,9 @@ public class GatewayV1DebugController {
     public ApiResponse<GatewayEnvelope> latestMissionStatus() {
         return ApiResponse.success(realtimeHub.latestMissionStatus().orElse(null));
     }
+
+    @GetMapping("/target-batch")
+    public ApiResponse<GatewayEnvelope> latestTargetBatch() {
+        return ApiResponse.success(realtimeHub.latestTargetBatch().orElse(null));
+    }
 }

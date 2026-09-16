@@ -94,7 +94,7 @@ export const useRealMissionRuntimeStore = defineStore('realMissionRuntime', {
       return realtimeStore.connected
         && isRealtimeEnvelopeApplicable(
           realtimeStore.poseBatch,
-          { runId: currentRunId },
+          { missionId: state.missionId ?? activeExperimentStore.missionId, runId: currentRunId },
           state.runScopePolicy,
         )
         && isPoseBatchLive(realtimeStore.poseBatch)
@@ -106,7 +106,7 @@ export const useRealMissionRuntimeStore = defineStore('realMissionRuntime', {
       const backendStatus = normalizeState(this.currentBackendMissionStatus)
       const missionStatus = isRealtimeEnvelopeApplicable(
         realtimeStore.missionStatus,
-        { runId: currentRunId },
+        { missionId: state.missionId ?? activeExperimentStore.missionId, runId: currentRunId },
         state.runScopePolicy,
       )
         ? realtimeStore.missionStatus?.payload
@@ -211,7 +211,7 @@ export const useRealMissionRuntimeStore = defineStore('realMissionRuntime', {
       const currentRunId = this.runId ?? activeExperimentStore.runId
       const missionStatus = isRealtimeEnvelopeApplicable(
         realtimeStore.missionStatus,
-        { runId: currentRunId },
+        { missionId: this.currentMissionId, runId: currentRunId },
         this.runScopePolicy,
       )
         ? realtimeStore.missionStatus?.payload

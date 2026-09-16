@@ -42,6 +42,16 @@ class GatewaySequenceGuardRunIsolationTests {
         assertEquals(GatewaySequenceGuard.SequenceCheckStatus.DUPLICATE, guard.inspect(uav1).status());
     }
 
+    @Test void keepsPoseAndTargetStreamsIndependentAndAcceptsNewTargetEpoch() {
+        assertEquals(GatewaySequenceGuard.SequenceCheckStatus.ACCEPTED, guard.inspect(envelope("A", 100)).status());
+        assertEquals(GatewaySequenceGuard.SequenceCheckStatus.ACCEPTED,
+                guard.inspect(targetEnvelope("A", "fleet.targets.epoch-a", 1)).status());
+        assertEquals(GatewaySequenceGuard.SequenceCheckStatus.DUPLICATE,
+                guard.inspect(targetEnvelope("A", "fleet.targets.epoch-a", 1)).status());
+        assertEquals(GatewaySequenceGuard.SequenceCheckStatus.ACCEPTED,
+                guard.inspect(targetEnvelope("A", "fleet.targets.epoch-b", 1)).status());
+    }
+
     private GatewayEnvelope envelope(String runId, long sequence) {
         return new GatewayEnvelope("1.0", GatewayMessageType.TELEMETRY_POSE_BATCH,
                 "ros", Instant.now(), runId, "pose", sequence, mapper.createObjectNode());
@@ -50,6 +60,11 @@ class GatewaySequenceGuardRunIsolationTests {
     private GatewayEnvelope controlAck(String runId, long sequence) {
         return new GatewayEnvelope("1.0", GatewayMessageType.CONTROL_ACK,
                 "ros", Instant.now(), runId, "control", sequence, mapper.createObjectNode());
+    }
+
+    private GatewayEnvelope targetEnvelope(String runId, String streamId, long sequence) {
+        return new GatewayEnvelope("1.0", GatewayMessageType.TELEMETRY_TARGET_BATCH,
+                "ros", Instant.now(), runId, streamId, sequence, mapper.createObjectNode());
     }
 
     private GatewayEnvelope deviceStatus(String streamId, long sequence) {

@@ -43,8 +43,10 @@ message GatewayEnvelope {
     LidarPointCloud lidar_pointcloud = 34;
     RadarScan radar_scan = 35;
     CameraFrame camera_frame = 36;
+    TargetBatch target_batch = 37;
   }
 }
+
 message GatewayHello {
   string instance_id = 1;
   repeated string supported_versions = 2;
@@ -235,4 +237,37 @@ message SystemError {
   string message = 2;
   bool retryable = 3;
   map<string, string> details = 4;
+}
+
+
+
+// World-model target state. Coordinates remain in the source frame.
+message TargetPose {
+  Vector3 position = 1;
+  Quaternion orientation = 2;
+}
+
+message TargetVelocity {
+  Vector3 linear = 1;
+  Vector3 angular = 2;
+}
+
+message TargetState {
+  string id = 1;
+  string frame_id = 2;
+  bool coordinate_valid = 3;
+  Vector3 position = 4;
+  TargetPose pose = 5;
+  TargetVelocity velocity = 6;
+  string source_stream = 7;
+  google.protobuf.Timestamp timestamp = 8;
+  string classification = 9;
+  string affiliation = 10;
+  double confidence = 11;
+}
+
+message TargetBatch {
+  google.protobuf.Timestamp snapshot_time = 1;
+  repeated TargetState targets = 2;
+  string frame_id = 3;
 }

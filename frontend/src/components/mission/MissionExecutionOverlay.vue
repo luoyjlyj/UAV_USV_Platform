@@ -17,7 +17,8 @@ import type { VehicleQuickCommand } from '@/components/control/VehicleQuickContr
 import UnifiedVehicleControl from '@/components/control/UnifiedVehicleControl.vue'
 import type { MissionTrajectorySessionState } from '@/stores/missionTrajectorySession'
 import type { UnityTrajectoryFrame } from '@/stores/trajectory'
-import type { AlgorithmRuntimeFrame, MissionDetail } from '@/types/mission'
+import type { MissionDetail } from '@/types/mission'
+import type { AuthoritativeFrame } from '@/types/authoritativeFrame'
 import type { RuntimeNode } from '@/types/monitoring'
 
 import AlgorithmTrajectoryMap from './CooperativeSituationHud.vue'
@@ -30,7 +31,7 @@ const props = defineProps<{
   detail: MissionDetail
   nodes: RuntimeNode[]
   trajectoryFrame: UnityTrajectoryFrame | null
-  algorithmFrame: AlgorithmRuntimeFrame | null
+  algorithmFrame: AuthoritativeFrame | null
   sessionState: MissionTrajectorySessionState
   sessionRevision: number
   selectedDeviceCode: string

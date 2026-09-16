@@ -9,6 +9,7 @@ import java.util.concurrent.atomic.AtomicReference;
 public class RealtimeHub {
 
     private final AtomicReference<GatewayEnvelope> latestPoseBatch = new AtomicReference<>();
+    private final AtomicReference<GatewayEnvelope> latestTargetBatch = new AtomicReference<>();
     private final AtomicReference<GatewayEnvelope> latestMissionStatus = new AtomicReference<>();
     private final RealtimeWebSocketHandler realtimeWebSocketHandler;
 
@@ -19,6 +20,8 @@ public class RealtimeHub {
     public void publish(GatewayEnvelope envelope) {
         if (envelope.isTelemetryPoseBatch()) {
             latestPoseBatch.set(envelope);
+        } else if (envelope.isTelemetryTargetBatch()) {
+            latestTargetBatch.set(envelope);
         } else if (envelope.isMissionStatus()) {
             latestMissionStatus.set(envelope);
         }
@@ -35,12 +38,17 @@ public class RealtimeHub {
         return Optional.ofNullable(latestMissionStatus.get());
     }
 
+    public Optional<GatewayEnvelope> latestTargetBatch() {
+        return Optional.ofNullable(latestTargetBatch.get());
+    }
+
     public RealtimeSnapshot snapshot() {
-        return new RealtimeSnapshot(latestPoseBatch.get(), latestMissionStatus.get());
+        return new RealtimeSnapshot(latestPoseBatch.get(), latestTargetBatch.get(), latestMissionStatus.get());
     }
 
     private boolean shouldBroadcast(GatewayMessageType type) {
         return type == GatewayMessageType.TELEMETRY_POSE_BATCH
+                || type == GatewayMessageType.TELEMETRY_TARGET_BATCH
                 || type == GatewayMessageType.MISSION_STATUS
                 || type == GatewayMessageType.CONTROL_ACK
                 || type == GatewayMessageType.CONTROL_FEEDBACK
@@ -49,6 +57,7 @@ public class RealtimeHub {
 
     public record RealtimeSnapshot(
             GatewayEnvelope latestPoseBatch,
+            GatewayEnvelope latestTargetBatch,
             GatewayEnvelope latestMissionStatus
     ) {
     }

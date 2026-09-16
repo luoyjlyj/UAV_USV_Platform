@@ -19,10 +19,13 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.context.ApplicationEventPublisher;
 
+import java.util.List;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -121,6 +124,61 @@ class RuntimeControlServiceGatewayStatusTests {
     }
 
     @Test
+    void startMissionAcceptedCompletesTheStartCommand() {
+        ControlCommand command = command(123L, RuntimeScope.MISSION_CENTER, CommandType.START_MISSION);
+
+        service.applyGatewayCommandStatus(command.getCommandKey(), "123", "ACCEPTED",
+                "mission accepted", null, "ROS_GATEWAY_V1");
+
+        assertEquals(CommandStatus.SUCCEEDED, command.getStatus());
+        verify(eventPublisher).publishEvent(new ControlCommandStatusChangedEvent(
+                command.getId(),
+                command.getCommandKey(),
+                command.getRunId(),
+                CommandType.START_MISSION,
+                CommandStatus.SUCCEEDED,
+                "mission accepted",
+                null
+        ));
+    }
+
+    @Test
+    void startMissionExecutingCompletesTheStartCommand() {
+        ControlCommand command = command(123L, RuntimeScope.MISSION_CENTER, CommandType.START_MISSION);
+
+        service.applyGatewayCommandStatus(command.getCommandKey(), "123", "EXECUTING",
+                "mission executing", null, "ROS_GATEWAY_V1");
+
+        assertEquals(CommandStatus.SUCCEEDED, command.getStatus());
+    }
+
+    @Test
+    void startMissionExecutingIsNotEligibleForResultTimeout() {
+        ControlCommand command = command(123L, RuntimeScope.MISSION_CENTER, CommandType.START_MISSION);
+
+        service.applyGatewayCommandStatus(command.getCommandKey(), "123", "EXECUTING",
+                "mission executing", null, "ROS_GATEWAY_V1");
+
+        assertEquals(CommandStatus.SUCCEEDED, command.getStatus());
+        assertFalse(List.of(CommandStatus.ACCEPTED, CommandStatus.EXECUTING).contains(command.getStatus()));
+    }
+
+    @Test
+    void nonStartExecutingCommandStillUsesResultTimeout() {
+        ControlCommand command = command(123L, RuntimeScope.MISSION_CENTER, CommandType.USV_HOLD);
+        command.execute("still executing");
+        when(commandRepository.findAllByStatusInAndDispatchedAtBefore(any(), any()))
+                .thenReturn(List.of());
+        when(commandRepository.findAllByStatusInAndAcknowledgedAtBefore(any(), any()))
+                .thenReturn(List.of(command));
+
+        service.expireUnacknowledgedCommands();
+
+        assertEquals(CommandStatus.TIMEOUT, command.getStatus());
+        assertEquals("RESULT_TIMEOUT", command.getErrorCode());
+    }
+
+    @Test
     void missionCenterResponseWithoutRunIdFailsAsMissing() {
         ControlCommand command = command(123L, RuntimeScope.MISSION_CENTER);
 
@@ -143,8 +201,12 @@ class RuntimeControlServiceGatewayStatusTests {
     }
 
     private ControlCommand command(Long runId, RuntimeScope scope) {
+        return command(runId, scope, CommandType.USV_HOLD);
+    }
+
+    private ControlCommand command(Long runId, RuntimeScope scope, CommandType commandType) {
         ControlCommand command = new ControlCommand(
-                1L, runId, 2L, CommandType.USV_HOLD, "{}", "test", scope, "instance");
+                1L, runId, 2L, commandType, "{}", "test", scope, "instance");
         command.dispatch("dispatched");
         when(commandRepository.findByCommandKey(command.getCommandKey())).thenReturn(Optional.of(command));
         when(commandRepository.save(command)).thenReturn(command);

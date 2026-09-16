@@ -1,20 +1,27 @@
 import { defineStore } from 'pinia'
 
+import { fetchRealtimeSnapshot } from '@/api/realtime'
+import type { RealtimeSnapshot } from '@/api/realtime'
+import { fetchRuntimeCommandLogs } from '@/api/runtimeControl'
 import type {
   ControlEventPayload,
   GatewayEnvelope,
   MissionStatusPayload,
   PoseBatchPayload,
+  TargetBatchPayload,
 } from '@/types/realtime'
 
 type RealtimeConnectionState = 'DISCONNECTED' | 'CONNECTING' | 'CONNECTED'
 
 interface RealtimeState {
   connectionState: RealtimeConnectionState
+  hydrating: boolean
+  hydrated: boolean
   lastError: string
   runId: string
   streamSequences: Record<string, number>
   poseBatch: GatewayEnvelope<PoseBatchPayload> | null
+  targetBatch: GatewayEnvelope<TargetBatchPayload> | null
   missionStatus: GatewayEnvelope<MissionStatusPayload> | null
   controlEvents: GatewayEnvelope<ControlEventPayload>[]
   commandStatuses: Record<string, string>
@@ -25,6 +32,7 @@ let socket: WebSocket | null = null
 let reconnectTimer: number | null = null
 let reconnectAttempts = 0
 let reconnectEnabled = false
+let hydrationPromise: Promise<void> | null = null
 
 function reconnectDelay() {
   return Math.min(1000 * 2 ** reconnectAttempts, 15000)
@@ -39,7 +47,7 @@ function realtimeUrl() {
 
 function streamKey(envelope: GatewayEnvelope) {
   const taskScoped = [
-    'telemetry.pose_batch', 'mission.status', 'control.ack', 'control.feedback', 'control.result',
+    'telemetry.pose_batch', 'telemetry.target_batch', 'mission.status', 'control.ack', 'control.feedback', 'control.result',
   ].includes(envelope.type)
   return taskScoped
     ? `${envelope.runId ?? 'missing-run'}:${envelope.source}:${envelope.streamId}`
@@ -63,6 +71,7 @@ function normalizeEnvelope(value: unknown): GatewayEnvelope | null {
     type: candidate.type,
     source: candidate.source,
     timestamp: String(candidate.timestamp ?? ''),
+    missionId: candidate.missionId ?? null,
     runId: candidate.runId ?? null,
     streamId: candidate.streamId,
     frameId: candidate.frameId ?? null,
@@ -74,10 +83,13 @@ function normalizeEnvelope(value: unknown): GatewayEnvelope | null {
 export const useRealtimeStore = defineStore('realtime', {
   state: (): RealtimeState => ({
     connectionState: 'DISCONNECTED',
+    hydrating: false,
+    hydrated: false,
     lastError: '',
     runId: '',
     streamSequences: {},
     poseBatch: null,
+    targetBatch: null,
     missionStatus: null,
     controlEvents: [],
     commandStatuses: {},
@@ -91,6 +103,7 @@ export const useRealtimeStore = defineStore('realtime', {
   actions: {
     connect() {
       reconnectEnabled = true
+      void this.hydrateSnapshot()
       if (socket && socket.readyState !== WebSocket.CLOSED) return
       if (reconnectTimer !== null) {
         window.clearTimeout(reconnectTimer)
@@ -121,6 +134,40 @@ export const useRealtimeStore = defineStore('realtime', {
         }
       }
     },
+    hydrateSnapshot() {
+      if (this.hydrated) return Promise.resolve()
+      if (hydrationPromise) return hydrationPromise
+
+      this.hydrating = true
+      hydrationPromise = fetchRealtimeSnapshot()
+        .then((snapshot) => {
+          this.ingestSnapshot(snapshot)
+          this.hydrated = true
+        })
+        .catch(() => {
+          // Snapshot hydration is best-effort; the WebSocket remains authoritative
+          // and will continue filling the store with subsequent realtime frames.
+        })
+        .finally(() => {
+          this.hydrating = false
+          hydrationPromise = null
+        })
+      return hydrationPromise
+    },
+    refreshSnapshot() {
+      return (hydrationPromise ?? Promise.resolve())
+        .then(() => fetchRealtimeSnapshot())
+        .then(snapshot => this.ingestSnapshot(snapshot))
+        .catch(() => {
+          // An explicit RUN-boundary refresh is also best-effort. Live WebSocket
+          // frames remain authoritative if the debug snapshot is unavailable.
+        })
+    },
+    ingestSnapshot(snapshot: RealtimeSnapshot) {
+      if (snapshot.latestPoseBatch) this.ingestMessage(snapshot.latestPoseBatch)
+      if (snapshot.latestTargetBatch) this.ingestMessage(snapshot.latestTargetBatch)
+      if (snapshot.latestMissionStatus) this.ingestMessage(snapshot.latestMissionStatus)
+    },
     disconnect() {
       reconnectEnabled = false
       if (reconnectTimer !== null) {
@@ -141,6 +188,8 @@ export const useRealtimeStore = defineStore('realtime', {
         this.runId = envelope.runId ?? this.runId
         if (envelope.type === 'telemetry.pose_batch') {
           this.poseBatch = envelope as GatewayEnvelope<PoseBatchPayload>
+        } else if (envelope.type === 'telemetry.target_batch') {
+          this.targetBatch = envelope as GatewayEnvelope<TargetBatchPayload>
         } else if (envelope.type === 'mission.status') {
           this.missionStatus = envelope as GatewayEnvelope<MissionStatusPayload>
         } else if (
@@ -185,7 +234,12 @@ export const useRealtimeStore = defineStore('realtime', {
         }, 100)
       })
     },
-    waitForCommandStart(commandId: string, timeoutMs = 90000): Promise<string> {
+    waitForCommandStart(
+      commandId: string,
+      timeoutMs = 90000,
+      initialStatus?: string,
+      expectedRunId?: number | string | null,
+    ): Promise<string> {
       const started = new Set(['ACCEPTED', 'EXECUTING'])
       const successfulTerminal = new Set(['SUCCEEDED', 'SUCCESS', 'COMPLETED'])
       const terminal = new Set(['FAILED', 'REJECTED', 'CANCELLED', 'TIMEOUT', 'EXPIRED'])
@@ -200,46 +254,88 @@ export const useRealtimeStore = defineStore('realtime', {
         'PURSUIT',
         'TASK_RUNNING',
       ])
+      const normalizedInitialStatus = String(initialStatus ?? '').trim().toUpperCase()
+      if (started.has(normalizedInitialStatus) || successfulTerminal.has(normalizedInitialStatus)) {
+        return Promise.resolve(normalizedInitialStatus)
+      }
+      if (terminal.has(normalizedInitialStatus)) return Promise.resolve(normalizedInitialStatus)
+
       return new Promise((resolve) => {
         const startedAt = Date.now()
+        let fallbackPending = false
+        let lastFallbackAt = 0
+        let settled = false
+        const finish = (status: string) => {
+          if (settled) return
+          settled = true
+          window.clearInterval(timer)
+          resolve(status)
+        }
+        const refreshFromBackend = () => {
+          if (fallbackPending || Date.now() - lastFallbackAt < 1000) return
+          fallbackPending = true
+          lastFallbackAt = Date.now()
+          const numericRunId = Number(expectedRunId)
+          void fetchRuntimeCommandLogs({
+            ...(Number.isFinite(numericRunId) && numericRunId > 0 ? { runId: numericRunId } : {}),
+            limit: 100,
+          })
+            .then((commands) => {
+              const command = commands.find(item => item.commandKey === commandId)
+              if (!command) return
+              const status = String(command.status ?? '').trim().toUpperCase()
+              this.commandStatuses[commandId] = status
+              if (started.has(status) || successfulTerminal.has(status) || terminal.has(status)) finish(status)
+            })
+            .catch(() => {
+              // The realtime stream remains the primary source. A transient
+              // read-fallback failure must not terminate the start wait early.
+            })
+            .finally(() => {
+              fallbackPending = false
+            })
+        }
         const timer = window.setInterval(() => {
-          const status = this.commandStatuses[commandId]
+          const status = String(this.commandStatuses[commandId] ?? '').trim().toUpperCase()
           if (status && started.has(status)) {
-            window.clearInterval(timer)
-            resolve(status)
+            finish(status)
             return
           }
           if (status && successfulTerminal.has(status)) {
-            window.clearInterval(timer)
-            resolve(status)
+            finish(status)
             return
           }
           if (status && terminal.has(status)) {
-            window.clearInterval(timer)
-            resolve(status)
+            finish(status)
             return
           }
 
           const mission = this.missionStatus?.payload
+          const missionEnvelopeRunId = String(this.missionStatus?.runId ?? mission?.runId ?? '').trim()
+          const expectedRun = String(expectedRunId ?? '').trim()
+          const missionApplies = !expectedRun || !missionEnvelopeRunId || missionEnvelopeRunId === expectedRun
           const state = String(mission?.state ?? '').trim().toUpperCase()
           const phase = String(mission?.phase ?? '').trim().toUpperCase()
-          if (runningStates.has(state) || runningPhases.has(phase)) {
-            window.clearInterval(timer)
-            resolve(state || phase)
-          } else if (successfulTerminal.has(state) || successfulTerminal.has(phase)) {
-            window.clearInterval(timer)
-            resolve(state || phase)
+          if (missionApplies && (runningStates.has(state) || runningPhases.has(phase))) {
+            finish(state || phase)
+          } else if (missionApplies && (successfulTerminal.has(state) || successfulTerminal.has(phase))) {
+            finish(state || phase)
           } else if (Date.now() - startedAt >= timeoutMs) {
-            window.clearInterval(timer)
-            resolve('TIMEOUT')
+            finish('COMMAND_START_WAIT_TIMEOUT')
+          } else {
+            refreshFromBackend()
           }
         }, 100)
+        refreshFromBackend()
       })
     },
     clear() {
+      this.hydrating = false
+      this.hydrated = false
       this.runId = ''
       this.streamSequences = {}
       this.poseBatch = null
+      this.targetBatch = null
       this.missionStatus = null
       this.controlEvents = []
       this.commandStatuses = {}
