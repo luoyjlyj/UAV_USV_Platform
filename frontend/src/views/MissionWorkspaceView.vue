@@ -20,6 +20,7 @@ import {
   fetchAlgorithmFrames,
   placeEscortThreat,
 } from '@/api/algorithm'
+import { ApiClientError } from '@/api/http'
 import { fetchMission } from '@/api/mission'
 import { useMissionStore } from '@/stores/mission'
 import { useActiveExperimentStore } from '@/stores/activeExperiment'
@@ -30,11 +31,10 @@ import { useRealMissionRuntimeStore } from '@/stores/realMissionRuntime'
 import { useTrajectoryStore } from '@/stores/trajectory'
 import { useUnityBridgeStore } from '@/stores/unityBridge'
 import { useUnityViewportStore } from '@/stores/unityViewport'
-import type { UnityTrajectoryFrame } from '@/stores/trajectory'
 import {
+  algorithmFrameToTrajectoryFrame,
   isRealtimeEnvelopeApplicable,
-  poseBatchToTrajectoryFrame,
-  trajectoryFrameToMissionCenterPoseFrame,
+  mergeAuthoritativeFrame,
 } from '@/services/realtimeTrajectoryAdapter'
 import type { AlgorithmRuntimeFrame, Mission, MissionDetail } from '@/types/mission'
 import type { RuntimeNode } from '@/types/monitoring'
@@ -55,12 +55,24 @@ const selectedDeviceCode = ref('')
 const loading = ref(true)
 const algorithmFrame = ref<AlgorithmRuntimeFrame | null>(null)
 const algorithmPolling = ref(false)
+type AlgorithmFrameState = 'WAITING_FIRST_FRAME' | 'NO_RUNTIME' | 'POLL_FAILED' | 'HISTORY_UNAVAILABLE' | 'LIVE'
+const algorithmFrameState = ref<AlgorithmFrameState>('WAITING_FIRST_FRAME')
 
 const unityChannel = computed(() => unityBridgeStore.channels.MISSION_CENTER)
 const currentRunId = computed(() => detail.value?.currentRun?.id ?? null)
 const activeAlgorithmCode = computed(() => detail.value?.mission.algorithmCode ?? '')
 const activeMission = computed(() => detail.value?.mission ?? null)
 const activeRun = computed(() => ['RUNNING', 'PAUSED'].includes(activeMission.value?.status ?? ''))
+const terminalRun = computed(() =>
+  ['CANCELLED', 'COMPLETED', 'FAILED'].includes(detail.value?.currentRun?.status ?? activeMission.value?.status ?? ''),
+)
+const algorithmFrameStatusText = computed(() => ({
+  WAITING_FIRST_FRAME: '等待算法首帧',
+  NO_RUNTIME: '当前 RUN 无算法运行实例',
+  POLL_FAILED: '算法帧轮询失败',
+  HISTORY_UNAVAILABLE: '算法历史帧不可用',
+  LIVE: '算法帧实时',
+})[algorithmFrameState.value])
 const workspaceRuntimeState = computed(() => realMissionRuntimeStore.runtimeState)
 const rosOnline = computed(() =>
   monitoringStore.nodes.some(node => node.type === 'ROS_NODE' && node.status === 'ONLINE'),
@@ -89,78 +101,46 @@ const statusLabel = computed(() => {
   return '待执行'
 })
 const runSyncText = computed(() => {
-  if (!detail.value?.currentRun) return '等待创建 RUN'
+  if (!detail.value?.currentRun) return mergedAuthoritativeFrame.value?.mode === 'OBSERVATION_ONLY'
+    ? 'OBSERVATION_2D_ONLY_NO_RUN'
+    : '等待创建 RUN'
   return `RUN ${detail.value.currentRun.runNo} · 同步帧 ${displayAlgorithmFrame.value?.sequence ?? 0}`
 })
 
 let algorithmPollTimer: number | null = null
 let algorithmAbortController: AbortController | null = null
 let loadedScenarioKey = ''
-let lastRealtimePoseFrameKey = ''
+let poseFreshnessTimer: number | null = null
+let unityPoseSequence = 0
+let unitySenderRunId: number | null = null
+let lastMergedPoseFingerprint = ''
+const poseFreshnessNow = ref(Date.now())
 
-const realtimeTrajectoryFrame = computed<UnityTrajectoryFrame | null>(() => {
+const applicablePoseBatch = computed(() => {
   const envelope = realtimeStore.poseBatch
-  if (!isRealtimeEnvelopeApplicable(envelope, { runId: currentRunId.value }, 'ALLOW_MISSING')) return null
-  const missionStatus = isRealtimeEnvelopeApplicable(
-    realtimeStore.missionStatus,
-    { runId: currentRunId.value },
-    'ALLOW_MISSING',
-  )
-    ? realtimeStore.missionStatus?.payload
-    : null
-  return poseBatchToTrajectoryFrame(envelope, {
-    missionId: detail.value?.mission.id ?? null,
-    runId: currentRunId.value,
-    phase: missionStatus?.phase ?? missionStatus?.state ?? 'ROS_GATEWAY_V1',
-  })
+  if (!isRealtimeEnvelopeApplicable(envelope, { missionId: activeMission.value?.id, runId: currentRunId.value }, 'OBSERVATION')) return null
+  return envelope
 })
 
-const trajectoryFrame = computed<UnityTrajectoryFrame | null>(() =>
-  realtimeTrajectoryFrame.value ?? trajectoryStore.channels.MISSION_CENTER.frame,
+const applicableTargetBatch = computed(() => {
+  const envelope = realtimeStore.targetBatch
+  if (!isRealtimeEnvelopeApplicable(envelope, { missionId: activeMission.value?.id, runId: currentRunId.value }, 'OBSERVATION')) return null
+  return envelope
+})
+
+const mergedAuthoritativeFrame = computed(() => mergeAuthoritativeFrame(
+  algorithmFrame.value,
+  applicablePoseBatch.value,
+  applicableTargetBatch.value,
+  poseFreshnessNow.value,
+  3000,
+  { missionId: activeMission.value?.id, runId: currentRunId.value },
+))
+
+const trajectoryFrame = computed(() =>
+  algorithmFrameToTrajectoryFrame(mergedAuthoritativeFrame.value),
 )
-
-const realtimeAlgorithmFrame = computed<AlgorithmRuntimeFrame | null>(() => {
-  const frame = realtimeTrajectoryFrame.value
-  if (!frame) return null
-  const poseRunId = Number(realtimeStore.poseBatch?.runId)
-  const runId = currentRunId.value ?? (Number.isFinite(poseRunId) && poseRunId > 0 ? poseRunId : 0)
-  return {
-    runId,
-    algorithmCode: activeAlgorithmCode.value || 'GB_SFLA_CS',
-    sequence: frame.sequence,
-    timestamp: frame.receivedAt,
-    phase: frame.mission.phase,
-    agents: frame.agents
-      .filter(agent => agent.type === 'UAV' || agent.type === 'USV')
-      .map(agent => ({
-        code: agent.code,
-        type: agent.type as 'UAV' | 'USV',
-        x: agent.x,
-        y: agent.z,
-        z: agent.y,
-        heading: agent.yaw,
-        role: agent.state,
-        status: agent.state,
-      })),
-    targets: frame.agents
-      .filter(agent => agent.type === 'TARGET')
-      .map(agent => ({
-        code: agent.code,
-        type: 'CAPTURE_TARGET' as const,
-        x: agent.x,
-        y: agent.z,
-        z: agent.y,
-        heading: agent.yaw,
-        visible: true,
-      })),
-    metrics: {},
-    route: [],
-    obstacles: [],
-    terminalStatus: null,
-  }
-})
-
-const displayAlgorithmFrame = computed(() => realtimeAlgorithmFrame.value ?? algorithmFrame.value)
+const displayAlgorithmFrame = mergedAuthoritativeFrame
 
 const runtimeNodes = computed<RuntimeNode[]>(() => {
   const frame = trajectoryFrame.value
@@ -202,40 +182,44 @@ function queryNumber(value: unknown) {
 
 function clearRunFrames() {
   algorithmFrame.value = null
+  algorithmFrameState.value = 'WAITING_FIRST_FRAME'
   loadedScenarioKey = ''
+  unityPoseSequence = 0
+  unitySenderRunId = null
+  lastMergedPoseFingerprint = ''
   trajectoryStore.clearFor('MISSION_CENTER')
   unityBridgeStore.clearPoseFramesFor('MISSION_CENTER')
 }
 
-function sendAlgorithmPoseFrame(frame: AlgorithmRuntimeFrame) {
-  unityBridgeStore.sendFor('MISSION_CENTER', 'poseFrame', {
-    algorithmCode: frame.algorithmCode,
-    runId: frame.runId,
-    sequence: frame.sequence,
+function sendMergedPoseFrameToUnity(force = false) {
+  const frame = mergedAuthoritativeFrame.value
+  const run = detail.value?.currentRun
+  if (!frame || !run || !unityChannel.value.controlsReady) return
+  const algorithmCode = frame.mode === 'ALGORITHM_MERGED' ? frame.algorithmCode : detail.value?.mission.algorithmCode
+  if (!algorithmCode || !['GB_SFLA_CS', 'ESCORT_GUARD'].includes(algorithmCode)) return
+  if (unitySenderRunId !== run.id) {
+    unitySenderRunId = run.id
+    unityPoseSequence = 0
+    lastMergedPoseFingerprint = ''
+  }
+  const sourcePayload = {
+    algorithmCode,
+    runId: run.id,
     timestamp: frame.timestamp,
-    phase: frame.phase,
+    phase: frame.phase ?? 'WAITING_FOR_ALGORITHM',
     agents: frame.agents,
     targets: frame.targets,
     route: frame.route.map(point => ({ x: point[0], y: point[1] })),
     obstacles: frame.obstacles,
+  }
+  const fingerprint = JSON.stringify(sourcePayload)
+  if (!force && fingerprint === lastMergedPoseFingerprint) return
+  lastMergedPoseFingerprint = fingerprint
+  unityPoseSequence += 1
+  unityBridgeStore.sendFor('MISSION_CENTER', 'poseFrame', {
+    ...sourcePayload,
+    sequence: unityPoseSequence,
   })
-}
-
-function sendRealtimePoseFrameToUnity(frame: UnityTrajectoryFrame | null) {
-  const run = detail.value?.currentRun
-  const mission = activeMission.value
-  if (!frame || frame.coordinateSystem !== 'ROS_ENU' || !run || !mission) return
-  if (!['GB_SFLA_CS', 'ESCORT_GUARD'].includes(mission.algorithmCode)) return
-  if (!unityChannel.value.controlsReady) return
-  const frameKey = `${run.id}:${frame.source}:${frame.sequence}`
-  if (frameKey === lastRealtimePoseFrameKey) return
-  lastRealtimePoseFrameKey = frameKey
-  const payload = trajectoryFrameToMissionCenterPoseFrame(frame, {
-    algorithmCode: mission.algorithmCode,
-    runId: run.id,
-    route: [],
-  })
-  if (payload) unityBridgeStore.sendFor('MISSION_CENTER', 'poseFrame', payload)
 }
 
 function ensureMissionScenarioLoaded() {
@@ -254,72 +238,47 @@ function ensureMissionScenarioLoaded() {
     missionId: mission.id,
     runId: run.id,
   })
-  if (algorithmFrame.value?.runId === run.id) sendAlgorithmPoseFrame(algorithmFrame.value)
-  sendRealtimePoseFrameToUnity(realtimeTrajectoryFrame.value)
   loadedScenarioKey = key
+  sendMergedPoseFrameToUnity(true)
 }
 
 function ingestAlgorithmFrame(frame: AlgorithmRuntimeFrame) {
   if (frame.runId !== currentRunId.value) return
   if (algorithmFrame.value && frame.sequence <= algorithmFrame.value.sequence) return
   algorithmFrame.value = frame
-  const agents = [
-    ...frame.agents.map(item => ({
-      code: item.code,
-      type: item.type,
-      x: item.x,
-      y: item.y,
-      z: item.z,
-      yaw: item.heading,
-      state: item.role,
-    })),
-    ...frame.targets
-      .filter(item => item.visible !== false)
-      .map(item => ({
-        code: item.code,
-        type: 'TARGET',
-        x: item.x,
-        y: item.y,
-        z: item.z,
-        yaw: item.heading,
-        state: item.type,
-      })),
-  ]
-  trajectoryStore.ingestFor('MISSION_CENTER', {
-    sequence: frame.sequence,
-    timestamp: frame.timestamp,
-    source: `algorithm:${frame.algorithmCode}`,
-    coordinateSystem: 'MISSION_SCENE_XZ',
-    mission: {
-      phase: frame.phase,
-      elapsed: Math.round(frame.sequence / 10),
-      captureRadius: Number(frame.metrics.usvFormationRadius ?? frame.metrics.captureRadius ?? 16),
-      defenseRadius: Number(
-        frame.metrics.escortFormationRadius ?? frame.metrics.uavFormationRadius ?? 18,
-      ),
-      captureReady: frame.metrics.captured === true,
-      formationHolding: frame.phase === 'CAPTURED' || frame.phase === 'THREAT_RESPONSE',
-    },
-    agents,
-  })
-  sendAlgorithmPoseFrame(frame)
 }
 
 async function pollAlgorithmFrames() {
   if (!currentRunId.value || algorithmPolling.value) return
   algorithmPolling.value = true
-  algorithmAbortController = new AbortController()
+  const controller = new AbortController()
+  algorithmAbortController = controller
   try {
     const frames = await fetchAlgorithmFrames(
       currentRunId.value,
       algorithmFrame.value?.sequence ?? 0,
-      algorithmAbortController.signal,
+      controller.signal,
     )
     frames.forEach(ingestAlgorithmFrame)
-  } catch {
+    algorithmFrameState.value = algorithmFrame.value ? 'LIVE' : 'WAITING_FIRST_FRAME'
+  } catch (error) {
+    if (controller.signal.aborted) return
+    const previousState = algorithmFrameState.value
+    if (error instanceof ApiClientError && error.status === 404) {
+      algorithmFrameState.value = terminalRun.value ? 'HISTORY_UNAVAILABLE' : 'NO_RUNTIME'
+    } else {
+      algorithmFrameState.value = 'POLL_FAILED'
+    }
+    if (previousState !== algorithmFrameState.value) {
+      console.error('[MissionWorkspace] algorithm frame polling failed', {
+        runId: currentRunId.value,
+        state: algorithmFrameState.value,
+        error,
+      })
+    }
     // 短暂轮询失败不应终止 RUN，也不在页面连续弹出错误。
   } finally {
-    algorithmAbortController = null
+    if (algorithmAbortController === controller) algorithmAbortController = null
     algorithmPolling.value = false
   }
 }
@@ -339,7 +298,11 @@ function startAlgorithmPolling(forceRunning = false) {
   algorithmPollTimer = window.setInterval(() => void pollAlgorithmFrames(), 100)
 }
 
-async function loadMissionWorkspace(mission: Mission, requestedRunId?: number | null) {
+async function loadMissionWorkspace(
+  mission: Mission,
+  requestedRunId?: number | null,
+  resumePolling = true,
+) {
   stopAlgorithmPolling()
   const loaded = await fetchMission(mission.id)
   if (requestedRunId) {
@@ -361,11 +324,11 @@ async function loadMissionWorkspace(mission: Mission, requestedRunId?: number | 
     loaded.currentRun?.id ?? null,
     loaded.currentRun?.runtimeInstanceId,
   )
-  if (loaded.currentRun) startAlgorithmPolling()
+  if (loaded.currentRun && resumePolling) startAlgorithmPolling()
   ensureMissionScenarioLoaded()
 }
 
-async function refreshWorkspace() {
+async function refreshWorkspace(resumePolling = true) {
   loading.value = true
   try {
     await Promise.all([
@@ -382,7 +345,7 @@ async function refreshWorkspace() {
       ?? openMission
       ?? missionStore.records[0]
     if (!mission) throw new Error('暂无可观测的任务数据')
-    await loadMissionWorkspace(mission, queryRunId)
+    await loadMissionWorkspace(mission, queryRunId, resumePolling)
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : '任务中心加载失败')
   } finally {
@@ -417,15 +380,25 @@ watch(
 
 watch(
   [
-    realtimeTrajectoryFrame,
+    mergedAuthoritativeFrame,
     () => unityChannel.value.controlsReady,
     currentRunId,
   ],
-  ([frame]) => sendRealtimePoseFrameToUnity(frame),
+  () => sendMergedPoseFrameToUnity(),
   { immediate: true },
 )
 
+watch(
+  () => unityChannel.value.scenarioReadyRunId,
+  readyRunId => {
+    if (readyRunId === currentRunId.value) sendMergedPoseFrameToUnity(true)
+  },
+)
+
 onMounted(async () => {
+  poseFreshnessTimer = window.setInterval(() => {
+    poseFreshnessNow.value = Date.now()
+  }, 500)
   unityViewportStore.park()
   realtimeStore.connect()
   monitoringStore.connectEvents()
@@ -435,11 +408,17 @@ onMounted(async () => {
 
 let resumeAfterDeactivation = false
 
-onActivated(() => {
+onActivated(async () => {
   if (!resumeAfterDeactivation) return
   resumeAfterDeactivation = false
   realtimeStore.connect()
   monitoringStore.connectEvents()
+  const previousRunId = currentRunId.value
+  await refreshWorkspace(false)
+  const nextRunId = currentRunId.value
+  if (nextRunId && previousRunId !== nextRunId) {
+    await realtimeStore.refreshSnapshot()
+  }
   if (activeRun.value || currentRunId.value) startAlgorithmPolling()
   unityViewportStore.park()
 })
@@ -452,6 +431,8 @@ onDeactivated(() => {
 
 onBeforeUnmount(() => {
   stopAlgorithmPolling()
+  if (poseFreshnessTimer !== null) window.clearInterval(poseFreshnessTimer)
+  poseFreshnessTimer = null
   unityViewportStore.park()
 })
 </script>
@@ -461,7 +442,7 @@ onBeforeUnmount(() => {
     <template #actions>
       <div class="mission-health">
         <span><i :class="{ online: rosOnline }" />ROS {{ rosOnline ? '在线' : '离线' }}</span>
-        <span><i :class="{ online: !!displayAlgorithmFrame }" />轨迹数据 {{ displayAlgorithmFrame ? '实时' : '等待中' }}</span>
+        <span><i :class="{ online: algorithmFrameState === 'LIVE' }" />{{ algorithmFrameStatusText }}</span>
         <span><i :class="{ online: onlineVehicleCount >= 6 }" />真实设备 {{ onlineVehicleCount }}/6</span>
       </div>
     </template>
@@ -481,6 +462,7 @@ onBeforeUnmount(() => {
         <main class="execution-stage">
           <AlgorithmTrajectoryMap
             :frame="displayAlgorithmFrame"
+            :algorithm-status-text="algorithmFrameStatusText"
             :selected-device-code="selectedDeviceCode"
             @select="selectObservationDevice"
             @place-threat="placeThreat"

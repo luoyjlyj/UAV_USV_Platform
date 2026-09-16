@@ -1,5 +1,6 @@
 import { defineStore } from 'pinia'
 import type { MissionDetail, MissionStatus } from '@/types/mission'
+import { resolveActiveRun } from '@/utils/missionRun'
 
 type ExperimentSnapshot = {
   missionId: number | null
@@ -33,12 +34,13 @@ export const useActiveExperimentStore = defineStore('active-experiment', {
       if (typeof window !== 'undefined') window.sessionStorage.setItem(STORAGE_KEY, JSON.stringify(this.$state))
     },
     sync(detail: MissionDetail) {
+      const run = resolveActiveRun(detail)
       this.missionId = detail.mission.id
-      this.runId = detail.currentRun?.id ?? null
-      this.runNo = detail.currentRun?.runNo ?? null
-      this.algorithmCode = detail.currentRun?.algorithmCode || detail.mission.algorithmCode
+      this.runId = run?.id ?? null
+      this.runNo = run?.runNo ?? null
+      this.algorithmCode = run?.algorithmCode || detail.mission.algorithmCode
       this.status = detail.mission.status
-      this.phase = detail.currentRun?.stage || detail.mission.stage
+      this.phase = run?.stage || detail.mission.stage
       this.persist()
     },
     updatePhase(phase: string) {

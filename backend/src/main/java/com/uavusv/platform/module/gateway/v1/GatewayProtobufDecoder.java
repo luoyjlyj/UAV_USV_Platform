@@ -34,6 +34,7 @@ public class GatewayProtobufDecoder {
                     type,
                     envelope.getSource(),
                     readTimestamp(envelope.hasTimestamp() ? envelope.getTimestamp() : null),
+                    blankToNull(envelope.getMissionId()),
                     blankToNull(envelope.getRunId()),
                     streamId(envelope, type),
                     blankToNull(envelope.getFrameId()),
@@ -51,6 +52,7 @@ public class GatewayProtobufDecoder {
             case GATEWAY_HEARTBEAT -> gatewayHeartbeat(envelope.getGatewayHeartbeat());
             case DEVICE_STATUS -> deviceStatus(envelope.getDeviceStatus());
             case POSE_BATCH -> poseBatch(envelope.getPoseBatch());
+            case TARGET_BATCH -> targetBatch(envelope.getTargetBatch());
             case MISSION_STATUS -> missionStatus(envelope.getMissionStatus());
             case CONTROL_ACK -> controlAck(envelope.getControlAck());
             case CONTROL_FEEDBACK -> controlFeedback(envelope.getControlFeedback());
@@ -145,6 +147,44 @@ public class GatewayProtobufDecoder {
             node.set("linearVelocityMps", vector(message.getLinearVelocityMps()));
         }
         node.put("headingDeg", message.getHeadingDeg());
+        return node;
+    }
+
+    private ObjectNode targetBatch(UavUsvGatewayV1.TargetBatch message) {
+        ObjectNode node = objectMapper.createObjectNode();
+        if (message.hasSnapshotTime()) {
+            node.put("snapshotTime", readTimestamp(message.getSnapshotTime()).toString());
+        }
+        node.put("frameId", message.getFrameId());
+        ArrayNode targets = objectMapper.createArrayNode();
+        message.getTargetsList().forEach(target -> targets.add(target(target)));
+        node.set("targets", targets);
+        return node;
+    }
+
+    private ObjectNode target(UavUsvGatewayV1.TargetState message) {
+        ObjectNode node = objectMapper.createObjectNode();
+        node.put("id", message.getId());
+        node.put("frameId", message.getFrameId());
+        node.put("coordinateValid", message.getCoordinateValid());
+        if (message.hasPosition()) node.set("position", vector(message.getPosition()));
+        if (message.hasPose()) {
+            ObjectNode pose = objectMapper.createObjectNode();
+            if (message.getPose().hasPosition()) pose.set("position", vector(message.getPose().getPosition()));
+            if (message.getPose().hasOrientation()) pose.set("orientation", quaternion(message.getPose().getOrientation()));
+            node.set("pose", pose);
+        }
+        if (message.hasVelocity()) {
+            ObjectNode velocity = objectMapper.createObjectNode();
+            if (message.getVelocity().hasLinear()) velocity.set("linear", vector(message.getVelocity().getLinear()));
+            if (message.getVelocity().hasAngular()) velocity.set("angular", vector(message.getVelocity().getAngular()));
+            node.set("velocity", velocity);
+        }
+        node.put("sourceStream", message.getSourceStream());
+        if (message.hasTimestamp()) node.put("timestamp", readTimestamp(message.getTimestamp()).toString());
+        node.put("classification", message.getClassification());
+        node.put("affiliation", message.getAffiliation());
+        node.put("confidence", message.getConfidence());
         return node;
     }
 
@@ -253,6 +293,15 @@ public class GatewayProtobufDecoder {
         node.put("x", value.getX());
         node.put("y", value.getY());
         node.put("z", value.getZ());
+        return node;
+    }
+
+    private ObjectNode quaternion(UavUsvGatewayV1.Quaternion value) {
+        ObjectNode node = objectMapper.createObjectNode();
+        node.put("x", value.getX());
+        node.put("y", value.getY());
+        node.put("z", value.getZ());
+        node.put("w", value.getW());
         return node;
     }
 

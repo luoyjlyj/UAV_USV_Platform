@@ -58,6 +58,7 @@ public class GatewaySequenceGuard {
 
     private boolean taskScoped(GatewayMessageType type) {
         return type == GatewayMessageType.TELEMETRY_POSE_BATCH
+                || type == GatewayMessageType.TELEMETRY_TARGET_BATCH
                 || type == GatewayMessageType.MISSION_STATUS
                 || type == GatewayMessageType.CONTROL_ACK
                 || type == GatewayMessageType.CONTROL_FEEDBACK

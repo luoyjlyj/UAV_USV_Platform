@@ -10,6 +10,8 @@ import com.uavusv.platform.module.mission.repository.MissionRunRepository;
 import jakarta.annotation.PreDestroy;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
@@ -28,10 +30,13 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 @Service
 public class AlgorithmRuntimeManager {
+    private static final Logger log = LoggerFactory.getLogger(AlgorithmRuntimeManager.class);
+    private static final int STDERR_TAIL_LINES = 80;
     private final ObjectMapper objectMapper;
     private final MissionRunRepository missionRunRepository;
     private final AlgorithmCatalogService algorithmCatalogService;
@@ -54,6 +59,8 @@ public class AlgorithmRuntimeManager {
     }
 
     public synchronized AlgorithmRuntimeStatusResponse prepare(Long runId, String algorithmCode, Map<String, Object> config) {
+        log.info("Algorithm prepare entered: runId={} algorithmCode={} runnerPath={} pythonCommand={}",
+                runId, algorithmCode, runnerPath, pythonCommand);
         Map<String, Object> runtimeConfig = config == null ? Map.of() : config;
         boolean standaloneVirtualSimulation = Boolean.TRUE.equals(
                 runtimeConfig.get("standaloneVirtualSimulation")
@@ -79,7 +86,7 @@ public class AlgorithmRuntimeManager {
                 && existing.error.get() == null) {
             return status(runId);
         }
-        stopExisting(runId);
+        stopExisting(runId, "prepare replacing existing runtime");
         if (standaloneVirtualSimulation) {
             stopOtherStandaloneSimulations(runId);
         }
@@ -107,23 +114,27 @@ public class AlgorithmRuntimeManager {
             builder.environment().put("PYTHONUNBUFFERED", "1");
             builder.environment().put("MPLCONFIGDIR", Path.of(System.getProperty("java.io.tmpdir"), "uav-usv-matplotlib").toString());
             Process process = builder.start();
+            logPythonExecutableAndVersion(runId, process);
+            log.info("Algorithm process started: runId={} algorithmCode={} pid={}", runId, algorithmCode, process.pid());
             RuntimeHandle handle = new RuntimeHandle(runId, algorithmCode, standaloneVirtualSimulation, process,
                     new BufferedWriter(new OutputStreamWriter(process.getOutputStream(), StandardCharsets.UTF_8)));
             handles.put(runId, handle);
+            log.info("Algorithm handle stored: runId={} pid={} handlesSize={}", runId, process.pid(), handles.size());
             startReaders(handle);
             // The first Python start may build the Matplotlib font cache and
             // import the vendor simulation, so 12 seconds is too short on a
             // cold Windows environment.
             if (!handle.ready.await(60, TimeUnit.SECONDS)) {
-                stopExisting(runId);
+                stopExisting(runId, "runner ready timeout");
                 throw new BusinessException(ErrorCode.BAD_REQUEST, "算法运行器启动超时");
             }
             if (!handle.initialFrameReady.await(60, TimeUnit.SECONDS)) {
-                stopExisting(runId);
+                stopExisting(runId, "initial frame timeout");
                 throw new BusinessException(ErrorCode.BAD_REQUEST, "Algorithm initial frame timeout");
             }
             if (handle.error.get() != null) {
-                stopExisting(runId);
+                String runtimeError = handle.error.get();
+                stopExisting(runId, "runtime error: " + runtimeError);
                 throw new BusinessException(ErrorCode.BAD_REQUEST, "算法运行器启动失败：" + handle.error.get());
             }
             return status(runId);
@@ -223,7 +234,20 @@ public class AlgorithmRuntimeManager {
         return run;
     }
 
+    private void signalProcessFailure(RuntimeHandle handle, String fallback) {
+        String stderr = stderrTail(handle);
+        String detail = stderr.isBlank() ? fallback : fallback + "; stderr tail:\n" + stderr;
+        handle.error.compareAndSet(null, detail);
+        handle.ready.countDown();
+        handle.initialFrameReady.countDown();
+        log.error("Algorithm runtime process/reader failure: runId={} pid={} detail={}",
+                handle.runId, handle.process.pid(), detail);
+    }
+
     private void startReaders(RuntimeHandle handle) {
+        handle.process.onExit().thenAccept(process ->
+                log.info("Algorithm process exited: runId={} pid={} exitCode={}",
+                        handle.runId, process.pid(), process.exitValue()));
         Thread outputThread = new Thread(() -> {
             try (BufferedReader reader = new BufferedReader(new InputStreamReader(handle.process.getInputStream(), StandardCharsets.UTF_8))) {
                 String line;
@@ -234,11 +258,15 @@ public class AlgorithmRuntimeManager {
                     } catch (Exception ignored) {
                         // Vendor algorithms may print diagnostics. Only NDJSON
                         // events belong to the runtime protocol.
+                        log.debug("Algorithm stdout non-JSON: runId={} pid={} line={}",
+                                handle.runId, handle.process.pid(), line);
                         continue;
                     }
                     String eventType = event.path("event").asText();
                     if ("runtimeReady".equals(eventType)) {
                         handle.state.set(event.path("state").asText("PREPARED"));
+                        log.info("Algorithm runtimeReady received: runId={} pid={} state={}",
+                                handle.runId, handle.process.pid(), handle.state.get());
                         handle.ready.countDown();
                     } else if ("frame".equals(eventType)) {
                         JsonNode frame = event.path("payload");
@@ -249,7 +277,13 @@ public class AlgorithmRuntimeManager {
                             handle.frameBuffer.addLast(frame);
                             while (handle.frameBuffer.size() > 300) handle.frameBuffer.removeFirst();
                         }
-                        if (sequence >= 1) handle.initialFrameReady.countDown();
+                        if (sequence >= 1) {
+                            handle.initialFrameReady.countDown();
+                            if (handle.firstFrameLogged.compareAndSet(false, true)) {
+                                log.info("Algorithm first frame received: runId={} pid={} sequence={}",
+                                        handle.runId, handle.process.pid(), sequence);
+                            }
+                        }
                     } else if ("stateChanged".equals(eventType) || "runtimeStopped".equals(eventType)) {
                         handle.state.set(event.path("state").asText(handle.state.get()));
                     }
@@ -262,9 +296,11 @@ public class AlgorithmRuntimeManager {
                             : detail);
                     handle.ready.countDown();
                 }
+                if (handle.initialFrameReady.getCount() > 0) {
+                    signalProcessFailure(handle, "algorithm stdout reached EOF before initial frame");
+                }
             } catch (Exception exception) {
-                handle.error.compareAndSet(null, exception.getMessage());
-                handle.ready.countDown();
+                signalProcessFailure(handle, "algorithm stdout reader failed: " + exception.getMessage());
             }
         }, "algorithm-out-" + handle.runId);
         outputThread.setDaemon(true);
@@ -276,6 +312,10 @@ public class AlgorithmRuntimeManager {
                 while ((line = reader.readLine()) != null) {
                     last = line;
                     handle.lastStderr.set(line);
+                    synchronized (handle.stderrTail) {
+                        handle.stderrTail.addLast(line);
+                        while (handle.stderrTail.size() > STDERR_TAIL_LINES) handle.stderrTail.removeFirst();
+                    }
                 }
                 if (handle.process.exitValue() != 0 && last != null) handle.error.compareAndSet(null, last);
             } catch (Exception ignored) {
@@ -307,9 +347,14 @@ public class AlgorithmRuntimeManager {
         return handle;
     }
 
-    private void stopExisting(Long runId) {
+    private void stopExisting(Long runId, String reason) {
         RuntimeHandle previous = handles.remove(runId);
-        if (previous == null) return;
+        if (previous == null) {
+            log.debug("Algorithm stopExisting found no handle: runId={} reason={}", runId, reason);
+            return;
+        }
+        log.warn("Algorithm handle removed: runId={} pid={} reason={} state={} error={} stderrTail={}",
+                runId, previous.process.pid(), reason, previous.state.get(), previous.error.get(), stderrTail(previous));
         try { previous.writer.close(); } catch (IOException ignored) {}
         previous.process.destroy();
         try {
@@ -320,13 +365,42 @@ public class AlgorithmRuntimeManager {
         }
     }
 
+    private String stderrTail(RuntimeHandle handle) {
+        synchronized (handle.stderrTail) {
+            return String.join(System.lineSeparator(), handle.stderrTail);
+        }
+    }
+
+    private void logPythonExecutableAndVersion(Long runId, Process runnerProcess) {
+        String executable = runnerProcess.info().command().orElse(pythonCommand);
+        log.info("Algorithm Python executable: runId={} executable={}", runId, executable);
+        Thread versionThread = new Thread(() -> {
+            try {
+                Process versionProcess = new ProcessBuilder(pythonCommand, "--version")
+                        .redirectErrorStream(true)
+                        .start();
+                boolean completed = versionProcess.waitFor(5, TimeUnit.SECONDS);
+                if (!completed) versionProcess.destroyForcibly();
+                String version = completed
+                        ? new String(versionProcess.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim()
+                        : "version query timed out";
+                log.info("Algorithm Python version: runId={} executable={} version={}", runId, executable, version);
+            } catch (Exception exception) {
+                log.warn("Unable to query algorithm Python version: runId={} executable={} error={}",
+                        runId, executable, exception.getMessage());
+            }
+        }, "algorithm-python-version-" + runId);
+        versionThread.setDaemon(true);
+        versionThread.start();
+    }
+
     private void stopOtherStandaloneSimulations(Long retainedRunId) {
         List<Long> staleRunIds = handles.values().stream()
                 .filter(handle -> handle.standaloneVirtualSimulation)
                 .map(handle -> handle.runId)
                 .filter(runId -> !runId.equals(retainedRunId))
                 .toList();
-        staleRunIds.forEach(this::stopExisting);
+        staleRunIds.forEach(runId -> stopExisting(runId, "replaced by standalone simulation " + retainedRunId));
     }
 
     private static Path resolveRunnerPath(String configuredPath) {
@@ -343,7 +417,7 @@ public class AlgorithmRuntimeManager {
 
     @PreDestroy
     public void close() {
-        new ArrayList<>(handles.keySet()).forEach(this::stopExisting);
+        new ArrayList<>(handles.keySet()).forEach(runId -> stopExisting(runId, "application shutdown"));
     }
 
     private static final class RuntimeHandle {
@@ -358,9 +432,11 @@ public class AlgorithmRuntimeManager {
         final AtomicReference<String> state = new AtomicReference<>("STARTING");
         final AtomicReference<String> error = new AtomicReference<>();
         final AtomicReference<String> lastStderr = new AtomicReference<>();
+        final AtomicBoolean firstFrameLogged = new AtomicBoolean();
         final AtomicReference<JsonNode> latestFrame = new AtomicReference<>();
         final AtomicLong latestSequence = new AtomicLong();
         final Deque<JsonNode> frameBuffer = new ArrayDeque<>();
+        final Deque<String> stderrTail = new ArrayDeque<>();
 
         RuntimeHandle(
                 Long runId,

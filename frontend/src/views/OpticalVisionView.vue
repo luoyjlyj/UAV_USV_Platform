@@ -17,6 +17,7 @@ const switching = ref(false)
 const targetFps = 30
 const feedElements = new Map<string, HTMLElement>()
 let timer: number | undefined
+let viewActive = false
 
 const overview = computed(() => store.displayOverview)
 const sensors = computed(() => overview.value.sensors)
@@ -55,6 +56,7 @@ function slotClass(cameraId: string) {
 }
 
 function subscribe(cameraId = focused.value?.cameraId || 'uav_01') {
+  if (!viewActive) return
   bridge.sendFor('SYSTEM_OVERVIEW', 'visualSensorSubscribe', {
     enabled: true,
     focusedCameraId: cameraId,
@@ -110,8 +112,10 @@ async function switchFocus(cameraId: string) {
 }
 
 onMounted(async () => {
+  viewActive = true
   store.connectFrameStream()
   await Promise.all([store.refreshOverview(), radarStore.refresh(true)])
+  if (!viewActive) return
   focusedCameraId.value = overview.value.focusedCameraId || sensors.value[0]?.cameraId || 'uav_01'
   await refreshFocusedStream(focusedCameraId.value)
   timer = window.setInterval(() => {
@@ -124,7 +128,7 @@ onMounted(async () => {
 watch(
   () => store.unityBridgeReady,
   async (ready) => {
-    if (!ready) return
+    if (!ready || !viewActive) return
     subscribe(focusedCameraId.value || focused.value?.cameraId || 'uav_01')
     await nextTick()
     window.dispatchEvent(new CustomEvent('unity-runtime-track', { detail: { duration: 900 } }))
@@ -133,17 +137,16 @@ watch(
 )
 
 onBeforeUnmount(() => {
-  if (store.unityBridgeReady) {
-    bridge.sendFor('SYSTEM_OVERVIEW', 'visualSensorSubscribe', {
-      enabled: false,
-      focusedCameraId: focusedCameraId.value || 'uav_01',
-      displayMode: 'off',
-      quality: quality.value,
-      targetFps,
-      gpuDirect: true,
-      jpegFallback: true,
-    })
-  }
+  viewActive = false
+  bridge.sendFor('SYSTEM_OVERVIEW', 'visualSensorSubscribe', {
+    enabled: false,
+    focusedCameraId: focusedCameraId.value || 'uav_01',
+    displayMode: 'off',
+    quality: quality.value,
+    targetFps,
+    gpuDirect: false,
+    jpegFallback: false,
+  })
   if (timer) window.clearInterval(timer)
   store.disconnectFrameStream()
   store.markUnityBridgeReady('SYSTEM_OVERVIEW', false)

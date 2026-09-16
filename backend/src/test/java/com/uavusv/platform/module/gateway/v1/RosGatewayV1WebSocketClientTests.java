@@ -19,6 +19,7 @@ import java.util.Base64;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.never;
 
 class RosGatewayV1WebSocketClientTests {
 
@@ -158,6 +159,41 @@ class RosGatewayV1WebSocketClientTests {
                 "EVALUATION",
                 "ROS_GATEWAY_V1"
         );
+        verify(socket).request(1);
+    }
+
+    @Test
+    void publishesTargetBatchOnlyToRealtimeHub() {
+        RealtimeHub realtimeHub = mock(RealtimeHub.class);
+        RuntimeStateService runtimeStateService = mock(RuntimeStateService.class);
+        SensorRuntimeService sensorRuntimeService = mock(SensorRuntimeService.class);
+        RosGatewayV1WebSocketClient client = new RosGatewayV1WebSocketClient(
+                mock(GatewayEnvelopeDecoder.class), new GatewayProtobufDecoder(objectMapper),
+                new GatewaySequenceGuard(), realtimeHub, eventPublisher, runtimeStateService,
+                missionRuntimeReconciler, mock(VisualSensorService.class), sensorRuntimeService,
+                "ws://127.0.0.1:8765/uav_usv/v1", "v1");
+        WebSocket socket = mock(WebSocket.class);
+        UavUsvGatewayV1.GatewayEnvelope protobuf = UavUsvGatewayV1.GatewayEnvelope.newBuilder()
+                .setSpecVersion("1.0")
+                .setMessageType("telemetry.target_batch")
+                .setSource("uav_usv_fleet_gateway")
+                .setStreamId("fleet.targets.epoch-a")
+                .setSequence(1)
+                .setTargetBatch(UavUsvGatewayV1.TargetBatch.newBuilder().setFrameId("map")
+                        .addTargets(UavUsvGatewayV1.TargetState.newBuilder()
+                                .setId("enemy_ship").setFrameId("map").setCoordinateValid(true)
+                                .setPosition(UavUsvGatewayV1.Vector3.newBuilder().setX(1).setY(2).setZ(3))
+                                .setTimestamp(Timestamp.newBuilder().setSeconds(1786900000))))
+                .build();
+
+        client.onBinary(socket, ByteBuffer.wrap(protobuf.toByteArray()), true);
+
+        var envelopeCaptor = org.mockito.ArgumentCaptor.forClass(GatewayEnvelope.class);
+        verify(realtimeHub).publish(envelopeCaptor.capture());
+        assertThat(envelopeCaptor.getValue().type()).isEqualTo(GatewayMessageType.TELEMETRY_TARGET_BATCH);
+        verify(runtimeStateService, never()).observeGatewayPoseBatch(
+                org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.anyLong());
+        verify(sensorRuntimeService, never()).observeRadarScan(org.mockito.ArgumentMatchers.any());
         verify(socket).request(1);
     }
 

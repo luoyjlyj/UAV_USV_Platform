@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 
 import OverviewUnityWebglPanel from '@/components/unity/OverviewUnityWebglPanel.vue'
 import UnityWebglPanel from '@/components/unity/UnityWebglPanel.vue'
@@ -31,6 +31,9 @@ const runtimePanel = ref<RuntimePanelApi | null>(null)
 const panelComponent = props.runtimeScope === 'SYSTEM_OVERVIEW'
   ? OverviewUnityWebglPanel
   : UnityWebglPanel
+const overlayTargetId = computed(() =>
+  `unity-runtime-overlay-${props.runtimeScope.toLowerCase().replace(/_/g, '-')}-${props.runtimeInstanceId}`,
+)
 let viewportElement: HTMLElement | null = null
 let resizeObserver: ResizeObserver | null = null
 let animationFrame = 0
@@ -152,6 +155,7 @@ onBeforeUnmount(() => {
         runId,
       }"
     />
+    <div :id="overlayTargetId" class="unity-runtime-overlay" aria-label="Unity HTML overlay"></div>
   </div>
 </template>
 
@@ -171,7 +175,16 @@ onBeforeUnmount(() => {
 }
 
 .unity-runtime-host :deep(.unity-webgl-panel) {
+  position: relative;
+  z-index: 0;
   width: 100%;
   height: 100%;
+}
+
+.unity-runtime-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
 }
 </style>

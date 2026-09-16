@@ -489,17 +489,22 @@ public class RuntimeControlService {
         }
         String status = gatewayStatus == null ? "" : gatewayStatus.trim().toUpperCase();
         String message = detail == null ? source + " " + status : detail;
-        switch (status) {
-            case "CREATED", "VALIDATING", "DISPATCHED", "ACCEPTED" -> command.accept(message);
-            case "EXECUTING" -> command.execute(message);
-            case "SUCCEEDED", "SUCCESS", "COMPLETED" -> command.succeedResult(message);
-            case "CANCELLED" -> command.cancel(message);
-            case "TIMEOUT", "EXPIRED" -> command.timeout(message);
-            case "REJECTED" -> command.reject(
-                    errorCode == null ? "ROS_GATEWAY_V1_COMMAND_REJECTED" : errorCode, message);
-            case "FAILED" -> command.fail(
-                    errorCode == null ? "ROS_GATEWAY_V1_COMMAND_FAILED" : errorCode, message);
-            default -> { return RuntimeCommandResponse.from(command); }
+        if (command.getCommandType() == CommandType.START_MISSION
+                && ("ACCEPTED".equals(status) || "EXECUTING".equals(status))) {
+            command.succeedResult(message);
+        } else {
+            switch (status) {
+                case "CREATED", "VALIDATING", "DISPATCHED", "ACCEPTED" -> command.accept(message);
+                case "EXECUTING" -> command.execute(message);
+                case "SUCCEEDED", "SUCCESS", "COMPLETED" -> command.succeedResult(message);
+                case "CANCELLED" -> command.cancel(message);
+                case "TIMEOUT", "EXPIRED" -> command.timeout(message);
+                case "REJECTED" -> command.reject(
+                        errorCode == null ? "ROS_GATEWAY_V1_COMMAND_REJECTED" : errorCode, message);
+                case "FAILED" -> command.fail(
+                        errorCode == null ? "ROS_GATEWAY_V1_COMMAND_FAILED" : errorCode, message);
+                default -> { return RuntimeCommandResponse.from(command); }
+            }
         }
         commandRepository.save(command);
         publishCommandStatus(command);

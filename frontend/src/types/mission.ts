@@ -1,4 +1,5 @@
 import type { DeviceStatus, DeviceType } from './device'
+import type { RealtimeQuaternion } from './realtime'
 
 export type MissionType =
   | 'TARGET_INSPECTION'
@@ -211,6 +212,17 @@ export interface AlgorithmTargetFrame {
   groupId?: string
   state?: string
   threatLevel?: number
+  canonicalTargetId?: string
+  externalTargetId?: string
+  orientation?: RealtimeQuaternion
+  positionAuthority?: 'ALGORITHM' | 'ROS_TARGET_BATCH'
+  frameId?: string
+  sourceStream?: string
+  sourceTimestamp?: string
+  classification?: string
+  affiliation?: string
+  confidence?: number
+  velocity?: import('./realtime').TargetVelocity
 }
 
 export interface AlgorithmRuntimeFrame {

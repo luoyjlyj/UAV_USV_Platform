@@ -16,7 +16,7 @@ import { computed, onActivated, onBeforeUnmount, onDeactivated, onMounted, ref, 
 import ConsoleLayout from '@/components/layout/ConsoleLayout.vue'
 import VehicleGlyph from '@/components/control/VehicleGlyph.vue'
 import type { VehicleQuickCommand } from '@/components/control/VehicleQuickControl.vue'
-import { fetchAlgorithms } from '@/api/algorithm'
+import { controlAlgorithmRun, fetchAlgorithms, prepareAlgorithmRun } from '@/api/algorithm'
 import { executeMissionAction, fetchMission, fetchMissions } from '@/api/mission'
 import type { MissionAction } from '@/api/mission'
 import { issueRuntimeCommand } from '@/api/runtimeControl'
@@ -29,13 +29,15 @@ import { useTrajectoryStore } from '@/stores/trajectory'
 import { useUnityBridgeStore } from '@/stores/unityBridge'
 import { useUnityViewportStore } from '@/stores/unityViewport'
 import {
+  buildSystemOverviewUnityPoses,
   isPoseBatchLive,
-  normalizeRealtimeDeviceCode,
   poseBatchToTrajectoryPayload,
   poseBatchTimestampMs,
+  systemOverviewPoseFrameKey,
 } from '@/services/realtimeTrajectoryAdapter'
 import type { RuntimeNode } from '@/types/monitoring'
 import { normalizeOperationalState } from '@/utils/runtimeOperationalState'
+import { resolveActiveRun } from '@/utils/missionRun'
 import type { AlgorithmDefinition, MissionDetail, MissionStatus } from '@/types/mission'
 
 type UnityMessage = {
@@ -46,6 +48,13 @@ type UnityMessage = {
 }
 
 type OverviewRuntimeMode = 'VIRTUAL_SIMULATION' | 'REAL'
+
+class PostMissionAlgorithmRuntimeError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'PostMissionAlgorithmRuntimeError'
+  }
+}
 
 const monitoringStore = useMonitoringStore()
 const realtimeStore = useRealtimeStore()
@@ -96,6 +105,7 @@ const commandBusy = ref(false)
 const cameraCommandBusy = ref(false)
 const cameraZoomPercent = ref(100)
 const cameraToolsVisible = ref(false)
+const dashboardViewActive = ref(true)
 let selectedDeviceSyncedToUnity = ''
 let overviewCameraInitialized = false
 let lastOverviewRealtimePoseFrameKey = ''
@@ -133,18 +143,17 @@ function deriveUnityRuntimeId(missionId: number, runtimeInstanceId = unityInstan
   return (hash >>> 0) % 0x7ffffffe + 1
 }
 
-function currentOverviewUnityRuntimeId() {
+function currentOverviewRealRunId(missionId = overviewMissionId.value) {
   if (overviewActiveMissionRunId.value) return overviewActiveMissionRunId.value
-  if (!overviewMissionId.value) return null
-  return deriveUnityRuntimeId(overviewMissionId.value)
+  if (realMissionRuntimeStore.currentRunId) return realMissionRuntimeStore.currentRunId
+  if (!missionId) return null
+  return deriveUnityRuntimeId(missionId)
 }
 
-function resolveActiveRun(detail?: MissionDetail | null) {
-  if (!detail) return null
-  if (detail.currentRun) return detail.currentRun
-  return [...detail.runs]
-    .reverse()
-    .find(run => ['PENDING', 'RUNNING', 'PAUSED'].includes(run.status)) ?? null
+function currentOverviewUnityPoseRunId() {
+  return overviewRuntimeMode.value === 'VIRTUAL_SIMULATION'
+    ? virtualScenarioRunId.value
+    : currentOverviewRealRunId()
 }
 
 function nextUnityPoseSequence(runtimeId: number) {
@@ -608,7 +617,7 @@ function pushPoseFrameToUnity() {
 
   if (poses.length === 0) return
 
-  const runId = currentOverviewUnityRuntimeId()
+  const runId = currentOverviewUnityPoseRunId()
   if (!runId) return
   unityBridgeStore.send('poseFrame', {
     runId: String(runId),
@@ -628,7 +637,7 @@ function pushRealtimePoseFrameToUnity() {
   }
   const realtimePoseBatch = realtimeStore.poseBatch
   if (!realtimePoseBatch) return
-  const runtimeId = currentOverviewUnityRuntimeId()
+  const runtimeId = currentOverviewRealRunId()
   if (!runtimeId) return
   const payload = poseBatchToTrajectoryPayload(realtimePoseBatch, {
     missionId: realMissionRuntimeStore.currentMissionId,
@@ -636,32 +645,20 @@ function pushRealtimePoseFrameToUnity() {
     phase: overviewRosMissionPhase.value,
   })
   if (!payload) return
-  const frameKey = `${runtimeId}:${payload.source}:${payload.sequence}`
+  const frameKey = systemOverviewPoseFrameKey(runtimeId, realtimePoseBatch, realtimeStore.targetBatch)
   if (frameKey === lastOverviewRealtimePoseFrameKey) return
   lastOverviewRealtimePoseFrameKey = frameKey
   trajectoryStore.ingestFor('SYSTEM_OVERVIEW', payload)
-  const poses = realtimePoseBatch.payload.vehicles
-    .filter(vehicle => {
-      const position = vehicle.localPositionEnuM
-      return !!position
-        && vehicle.fresh !== false
-        && vehicle.positionValid !== false
-        && Number.isFinite(position.x)
-        && Number.isFinite(position.y)
-        && Number.isFinite(position.z)
-    })
-    .map(vehicle => {
-      const deviceCode = normalizeRealtimeDeviceCode(vehicle.deviceCode)
-      const localPosition = vehicle.localPositionEnuM!
-      return {
-        deviceCode,
-        position: [localPosition.x, localPosition.y, localPosition.z],
-      }
-    })
+  const poses = buildSystemOverviewUnityPoses(
+    realtimePoseBatch,
+    realtimeStore.targetBatch,
+  )
   if (!poses.length) return
+  const poseRunId = currentOverviewUnityPoseRunId()
+  if (!poseRunId) return
   unityBridgeStore.sendFor('SYSTEM_OVERVIEW', 'poseFrame', {
-    runId: String(runtimeId),
-    sequence: nextUnityPoseSequence(runtimeId),
+    runId: String(poseRunId),
+    sequence: nextUnityPoseSequence(poseRunId),
     timestamp: poseBatchTimestampMs(realtimePoseBatch) || Date.now(),
     source: 'vue-ros',
     // Current realtime positions are already in the shared display map ENU.
@@ -683,10 +680,10 @@ function applyOverviewMissionDetail(detail: MissionDetail) {
   overviewMissionStatus.value = detail.mission.status
   realMissionRuntimeStore.syncContext({
     missionId: detail.mission.id,
-    runId: detail.currentRun?.id ?? null,
+    runId: activeRun?.id ?? null,
     backendMissionStatus: detail.mission.status,
   })
-  const currentRunId = detail.currentRun?.id
+  const currentRunId = activeRun?.id
   const latestControlEvent = detail.events.find((event) =>
     event.runId === currentRunId && /^(MISSION_CONTROL|SYSTEM_OVERVIEW):/.test(event.source ?? ''),
   )
@@ -734,6 +731,14 @@ function missionUnityCommand(action: MissionAction) {
   }[action]
 }
 
+function externalAlgorithm(code: string) {
+  return code === 'GB_SFLA_CS' || code === 'ESCORT_GUARD'
+}
+
+function algorithmConfig(current: MissionDetail) {
+  return Object.fromEntries(current.parameters.map(item => [item.key, item.value ?? '']))
+}
+
 async function runOverviewMissionAction(action: MissionAction) {
   if (!overviewMissionId.value) {
     await loadOverviewMission()
@@ -744,19 +749,28 @@ async function runOverviewMissionAction(action: MissionAction) {
   const result = await executeMissionAction(missionId, action, 'SYSTEM_OVERVIEW')
   applyOverviewMissionDetail(result.detail)
 
+  if (result.command && (result.command.status === 'FAILED' || result.command.status === 'TIMEOUT')) {
+    throw new Error(result.command.detail || '任务指令未能下发')
+  }
+
   if (result.command) {
     if (action === 'start') realMissionRuntimeStore.noteStartCommand(result.command.commandKey)
     if (action === 'cancel') realMissionRuntimeStore.noteCancelCommand(result.command.commandKey)
-    if (result.command.status === 'FAILED' || result.command.status === 'TIMEOUT') {
-      throw new Error(result.command.detail || '任务指令未能下发')
-    }
     if (overviewRuntimeMode.value === 'REAL') {
       const rosStatus = action === 'start'
-        ? await realtimeStore.waitForCommandStart(result.command.commandKey, 90000)
+        ? await realtimeStore.waitForCommandStart(
+            result.command.commandKey,
+            90000,
+            result.command.status,
+            result.detail.currentRun?.id,
+          )
         : await realtimeStore.waitForCommandResult(result.command.commandKey, 90000)
       if (action === 'start') {
+        if (rosStatus === 'COMMAND_START_WAIT_TIMEOUT') {
+          throw new Error(`COMMAND_START_WAIT_TIMEOUT：90 秒内未确认真实任务启动（commandKey=${result.command.commandKey}）`)
+        }
         if (['FAILED', 'REJECTED', 'CANCELLED', 'TIMEOUT', 'EXPIRED'].includes(rosStatus)) {
-          throw new Error(`真实任务启动指令未确认：${rosStatus}`)
+          throw new Error(`COMMAND_START_FAILED：真实任务启动指令返回 ${rosStatus}（commandKey=${result.command.commandKey}）`)
         }
       } else if (rosStatus !== 'SUCCEEDED') {
         throw new Error(`真实任务指令未收到成功结果：${rosStatus}`)
@@ -771,6 +785,37 @@ async function runOverviewMissionAction(action: MissionAction) {
       if (!acknowledgement.success) {
         throw new Error(acknowledgement.status || 'Unity 未确认任务指令')
       }
+    }
+  }
+
+  if (action === 'start' && externalAlgorithm(result.detail.mission.algorithmCode)) {
+    const newRun = result.detail.currentRun
+    if (!newRun) throw new Error('任务启动成功，但响应中没有新创建的 MissionRun')
+    try {
+      await prepareAlgorithmRun(
+        newRun.id,
+        result.detail.mission.algorithmCode,
+        algorithmConfig(result.detail),
+      )
+      await controlAlgorithmRun(newRun.id, 'start')
+    } catch (error) {
+      console.error('[Dashboard] algorithm runtime start failed', {
+        missionId,
+        runId: newRun.id,
+        algorithmCode: result.detail.mission.algorithmCode,
+        error,
+      })
+      const message = error instanceof Error ? error.message : '未知错误'
+      const category = /Algorithm initial frame timeout/i.test(message)
+        ? 'ALGORITHM_INITIAL_FRAME_TIMEOUT'
+        : /算法运行器启动超时/i.test(message)
+          ? 'ALGORITHM_RUNNER_READY_TIMEOUT'
+          : /后端响应超时|ECONNABORTED|ETIMEDOUT/i.test(message)
+            ? 'HTTP_TIMEOUT'
+            : 'ALGORITHM_START_FAILED'
+      throw new PostMissionAlgorithmRuntimeError(
+        `${category}：任务已启动，但算法运行实例启动失败（MissionRun ${newRun.id}）：${message}`,
+      )
     }
   }
 
@@ -1088,8 +1133,11 @@ function sendRealOverviewScenario(detail?: MissionDetail | null) {
   const missionId = detail?.mission.id ?? overviewMissionId.value
   if (!missionId) return
   const activeRun = resolveActiveRun(detail)
-  if (detail) overviewActiveMissionRunId.value = activeRun?.id ?? null
-  const runId = activeRun?.id ?? currentOverviewUnityRuntimeId()
+  if (detail) {
+    overviewActiveMissionRunId.value = activeRun?.id ?? null
+  }
+
+  const runId = currentOverviewRealRunId(missionId)
   const algorithmCode = detail?.mission.algorithmCode ?? selectedOverviewAlgorithm.value
   if (!runId) return
   const scenarioKey = `${missionId}:${runId}:${algorithmCode}`
@@ -1118,7 +1166,7 @@ function syncRealOverviewUnityScene() {
 }
 
 async function triggerRealOverviewMissionStart(detail: MissionDetail) {
-  const run = detail.currentRun
+  const run = resolveActiveRun(detail)
   if (!run) throw new Error('当前真实任务没有可启动的运行批次')
   const result = await issueRuntimeCommand({
     commandType: 'START_MISSION',
@@ -1131,9 +1179,12 @@ async function triggerRealOverviewMissionStart(detail: MissionDetail) {
   if (result.status === 'FAILED' || result.status === 'TIMEOUT') {
     throw new Error(result.detail || '真实任务启动指令未能下发')
   }
-  const rosStatus = await realtimeStore.waitForCommandStart(result.commandKey, 90000)
+  const rosStatus = await realtimeStore.waitForCommandStart(result.commandKey, 90000, result.status, run.id)
+  if (rosStatus === 'COMMAND_START_WAIT_TIMEOUT') {
+    throw new Error(`COMMAND_START_WAIT_TIMEOUT：90 秒内未确认真实任务启动（commandKey=${result.commandKey}）`)
+  }
   if (['FAILED', 'REJECTED', 'CANCELLED', 'TIMEOUT', 'EXPIRED'].includes(rosStatus)) {
-    throw new Error(`真实任务启动指令未确认：${rosStatus}`)
+    throw new Error(`COMMAND_START_FAILED：真实任务启动指令返回 ${rosStatus}（commandKey=${result.commandKey}）`)
   }
 }
 
@@ -1194,6 +1245,17 @@ async function finishOverviewMission(action: 'return' | 'abort') {
   }
   await runOverviewDemoCommand('cancel')
   overviewDeploymentAcknowledged.value = false
+}
+
+function overviewMissionActionError(error: unknown, action: string) {
+  const message = error instanceof Error ? error.message : '任务编组操作失败'
+  if (action !== 'start' || /^[A-Z_]+：/.test(message)) return message
+  if (/后端响应超时|ECONNABORTED|ETIMEDOUT/i.test(message)) return `HTTP_TIMEOUT：${message}`
+  return message
+}
+
+function isPostMissionAlgorithmRuntimeError(error: unknown, action: string) {
+  return action === 'start' && error instanceof PostMissionAlgorithmRuntimeError
 }
 
 async function handleMissionGroupAction(action: 'deploy' | 'start' | 'pause' | 'resume' | 'return' | 'abort') {
@@ -1289,7 +1351,11 @@ async function handleMissionGroupAction(action: 'deploy' | 'start' | 'pause' | '
     await finishOverviewMission('return')
     ElMessage.success('全体返航已确认，当前任务已结束')
   } catch (error) {
-    ElMessage.error(error instanceof Error ? error.message : '任务编组操作失败')
+    if (isPostMissionAlgorithmRuntimeError(error, action)) {
+      console.error('[Dashboard] mission started; algorithm runtime error remains visible in page state', error)
+    } else {
+      ElMessage.error(overviewMissionActionError(error, action))
+    }
   } finally {
     commandBusy.value = false
   }
@@ -1312,7 +1378,7 @@ function handleUnityMessage(message: UnityMessage) {
   lastUnityEvent.value = message.type
 
   if (message.type === 'scenarioLoaded' && payload.success === true) {
-    unityPoseRunId = String(payload.runId ?? currentOverviewUnityRuntimeId() ?? '')
+    unityPoseRunId = String(payload.runId ?? currentOverviewRealRunId() ?? '')
     poseFrameSequence = 0
   }
 
@@ -1417,11 +1483,13 @@ onMounted(() => {
 })
 
 onActivated(() => {
+  dashboardViewActive.value = true
   unityViewportStore.show('dashboard')
   overviewCameraInitialized = false
   ensureOverviewCamera()
 })
 onDeactivated(() => {
+  dashboardViewActive.value = false
   if (unityViewportStore.target === 'dashboard') unityViewportStore.park()
 })
 
@@ -1439,6 +1507,9 @@ watch(
     realtimeStore.poseBatch?.source ?? '',
     realtimeStore.poseBatch?.sequence ?? 0,
     realtimeStore.poseBatch?.timestamp ?? '',
+    realtimeStore.targetBatch?.runId ?? '',
+    realtimeStore.targetBatch?.sequence ?? 0,
+    realtimeStore.targetBatch?.timestamp ?? '',
     overviewRosMissionPhase.value,
   ] as const,
   () => pushRealtimePoseFrameToUnity(),
@@ -1633,56 +1704,61 @@ watch(
             </div>
           </div>
 
-          <div
-            class="overview-camera-tools"
-            :class="{ visible: cameraToolsVisible }"
-            aria-label="Unity 相机缩放控制"
+          <Teleport
+            v-if="dashboardViewActive"
+            to="#unity-runtime-overlay-system-overview-overview-unity-01"
           >
-            <span>滚轮缩放</span>
-            <input
-              :value="cameraZoomPercent"
-              type="range"
-              min="42"
-              max="225"
-              step="1"
-              :disabled="!unityCameraReady"
-              aria-label="Unity 相机缩放比例"
-              @input="setUnityZoom"
+            <div
+              class="overview-camera-tools"
+              :class="{ visible: cameraToolsVisible }"
+              aria-label="Unity 相机缩放控制"
             >
-            <b>{{ cameraZoomPercent }}%</b>
-            <button type="button" :disabled="!unityCameraReady" @click="fitUnityOverview">
-              <RotateCcw :size="14" />
-              适配全貌
-            </button>
-          </div>
-
-          <section
-            v-if="selectedOverviewDevice"
-            class="overview-selected-control"
-            :class="selectedOverviewDevice.type.toLowerCase()"
-            aria-label="当前设备快捷控制"
-          >
-            <header>
-              <span>当前设备</span>
-              <strong>{{ selectedOverviewDevice.code.toUpperCase() }}</strong>
-              <b :class="(selectedOverviewDevice.status || 'UNKNOWN').toLowerCase()">
-                {{ runtimeStatusLabel(selectedOverviewDevice.status) }}
-              </b>
-            </header>
-            <div class="overview-selected-actions">
-              <button
-                v-for="action in selectedOverviewActions"
-                :key="action.commandType"
-                type="button"
-                :class="{ danger: action.danger }"
-                :disabled="(commandBusy && !isUsvSafetyStop(action.commandType)) || !isSelectedOverviewActionAllowed(action)"
-                @click="issueSelectedQuickCommand(action)"
+              <span>滚轮缩放</span>
+              <input
+                :value="cameraZoomPercent"
+                type="range"
+                min="42"
+                max="225"
+                step="1"
+                :disabled="!unityCameraReady"
+                aria-label="Unity 相机缩放比例"
+                @input="setUnityZoom"
               >
-                <component :is="action.icon" :size="19" :stroke-width="1.9" />
-                <span>{{ action.label }}</span>
+              <b>{{ cameraZoomPercent }}%</b>
+              <button type="button" :disabled="!unityCameraReady" @click="fitUnityOverview">
+                <RotateCcw :size="14" />
+                适配全貌
               </button>
             </div>
-          </section>
+
+            <section
+              v-if="selectedOverviewDevice"
+              class="overview-selected-control"
+              :class="selectedOverviewDevice.type.toLowerCase()"
+              aria-label="当前设备快捷控制"
+            >
+              <header>
+                <span>当前设备</span>
+                <strong>{{ selectedOverviewDevice.code.toUpperCase() }}</strong>
+                <b :class="(selectedOverviewDevice.status || 'UNKNOWN').toLowerCase()">
+                  {{ runtimeStatusLabel(selectedOverviewDevice.status) }}
+                </b>
+              </header>
+              <div class="overview-selected-actions">
+                <button
+                  v-for="action in selectedOverviewActions"
+                  :key="action.commandType"
+                  type="button"
+                  :class="{ danger: action.danger }"
+                  :disabled="(commandBusy && !isUsvSafetyStop(action.commandType)) || !isSelectedOverviewActionAllowed(action)"
+                  @click="issueSelectedQuickCommand(action)"
+                >
+                  <component :is="action.icon" :size="19" :stroke-width="1.9" />
+                  <span>{{ action.label }}</span>
+                </button>
+              </div>
+            </section>
+          </Teleport>
         </div>
       </section>
 

@@ -40,6 +40,7 @@ public class RosGatewayV1WebSocketClient implements WebSocket.Listener {
 
     private static final Logger log = LoggerFactory.getLogger(RosGatewayV1WebSocketClient.class);
     private static final long CAMERA_FRAME_LOG_INTERVAL_MILLIS = 5_000;
+    private static final long TARGET_BATCH_LOG_INTERVAL_MILLIS = 5_000;
 
     private final GatewayEnvelopeDecoder gatewayEnvelopeDecoder;
     private final GatewayProtobufDecoder gatewayProtobufDecoder;
@@ -59,6 +60,7 @@ public class RosGatewayV1WebSocketClient implements WebSocket.Listener {
     private final StringBuilder messageBuffer = new StringBuilder();
     private final ByteArrayOutputStream binaryMessageBuffer = new ByteArrayOutputStream();
     private final Map<String, Long> cameraFrameLogTimes = new ConcurrentHashMap<>();
+    private final Map<String, Long> targetBatchLogTimes = new ConcurrentHashMap<>();
     private volatile WebSocket socket;
     private volatile boolean closing;
 
@@ -242,6 +244,7 @@ public class RosGatewayV1WebSocketClient implements WebSocket.Listener {
         if (observeHighVolumeSensor(envelope)) {
             return;
         }
+        logTargetBatch(envelope);
         realtimeHub.publish(envelope);
         if (stateAuthority) observeRuntimeState(envelope);
         publishControlAckEvent(envelope);
@@ -434,6 +437,27 @@ public class RosGatewayV1WebSocketClient implements WebSocket.Listener {
                 height,
                 base64Length,
                 accepted
+        );
+    }
+
+    private void logTargetBatch(GatewayEnvelope envelope) {
+        if (envelope.type() != GatewayMessageType.TELEMETRY_TARGET_BATCH) return;
+        String key = envelope.source() + ":" + envelope.streamId();
+        long now = System.currentTimeMillis();
+        Long previous = targetBatchLogTimes.get(key);
+        if (previous != null && now - previous < TARGET_BATCH_LOG_INTERVAL_MILLIS) return;
+        targetBatchLogTimes.put(key, now);
+        JsonNode targets = envelope.payload().path("targets");
+        JsonNode target = targets.isArray() && !targets.isEmpty() ? targets.path(0) : null;
+        log.info(
+                "Gateway target batch: streamId={} sequence={} targetCount={} id={} frameId={} "
+                        + "coordinateValid={} position={} sourceTimestamp={}",
+                envelope.streamId(), envelope.sequence(), targets.isArray() ? targets.size() : 0,
+                target == null ? "<none>" : text(target, "id"),
+                target == null ? "<none>" : text(target, "frameId"),
+                target != null && target.path("coordinateValid").asBoolean(false),
+                target == null ? "<none>" : target.path("position"),
+                target == null ? "<none>" : text(target, "timestamp")
         );
     }
 

@@ -9,6 +9,7 @@ public enum GatewayMessageType {
     GATEWAY_HEARTBEAT("gateway.heartbeat"),
     DEVICE_STATUS("device.status"),
     TELEMETRY_POSE_BATCH("telemetry.pose_batch"),
+    TELEMETRY_TARGET_BATCH("telemetry.target_batch"),
     MISSION_STATUS("mission.status"),
     MEDIA_CAMERA_JPEG("media.camera_jpeg"),
     PERCEPTION_RADAR_SCAN("perception.radar_scan"),

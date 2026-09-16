@@ -23,6 +23,7 @@ public class GatewayEnvelopeDecoder {
                     text(root, "type", text(root, "messageType", null))
             );
             String source = requireText(root, "source");
+            String missionId = text(root, "missionId", text(root, "mission_id", null));
             String runId = text(root, "runId", text(root, "run_id", null));
             String streamId = text(root, "streamId", text(root, "stream_id", type.wireName()));
             long sequence = root.path("sequence").asLong(-1);
@@ -35,6 +36,7 @@ public class GatewayEnvelopeDecoder {
                     type,
                     source,
                     readTimestamp(root.path("timestamp")),
+                    missionId,
                     runId,
                     streamId,
                     sequence,
